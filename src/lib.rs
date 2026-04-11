@@ -10,17 +10,21 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_os = "linux")]
 pub mod cgroup;
 pub mod diskquota;
 pub mod env;
 mod error;
 pub mod ffi;
+#[cfg(target_os = "linux")]
 pub mod landlock;
+#[cfg(target_os = "linux")]
 pub mod netns;
 pub mod platform;
 mod process;
 mod profile;
 pub mod rlimit;
+#[cfg(target_os = "linux")]
 pub mod seccomp;
 mod validate;
 

@@ -5,6 +5,7 @@
 //! that restricted actions fail appropriately.
 //!
 //! Requires Linux with Landlock (5.13+) and seccomp.
+#![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
 use std::process::Command;

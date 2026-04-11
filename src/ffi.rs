@@ -237,13 +237,16 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         return -1;
     };
 
-    if let Err(e) = crate::landlock::apply(inner) {
-        set_error(&format!("landlock: {e}"));
-        return -1;
-    }
-    if let Err(e) = crate::seccomp::apply() {
-        set_error(&format!("seccomp: {e}"));
-        return -1;
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = crate::landlock::apply(inner) {
+            set_error(&format!("landlock: {e}"));
+            return -1;
+        }
+        if let Err(e) = crate::seccomp::apply() {
+            set_error(&format!("seccomp: {e}"));
+            return -1;
+        }
     }
     if let Err(e) = crate::rlimit::apply(inner) {
         set_error(&format!("rlimit: {e}"));
@@ -257,13 +260,27 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
 /// Probe the Landlock ABI version. Returns 0 if unavailable.
 #[unsafe(no_mangle)]
 pub extern "C" fn arapuca_landlock_abi_version() -> u32 {
-    crate::landlock::abi_version()
+    #[cfg(target_os = "linux")]
+    {
+        crate::landlock::abi_version()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 /// Probe whether network namespace isolation is available.
 #[unsafe(no_mangle)]
 pub extern "C" fn arapuca_netns_available() -> bool {
-    crate::netns::available()
+    #[cfg(target_os = "linux")]
+    {
+        crate::netns::available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 // --- Error handling ---

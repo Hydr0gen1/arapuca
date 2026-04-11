@@ -10,12 +10,12 @@ use crate::{Config, process::Process};
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 mod other;
 
 #[cfg(target_os = "linux")]
 pub use linux::Linux;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 pub use other::Other;
 
 /// Platform-specific sandbox implementation.
@@ -54,7 +54,7 @@ pub fn new() -> crate::Result<Linux> {
 }
 
 /// Create the appropriate sandbox for the current platform (fallback).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 pub fn new() -> crate::Result<Other> {
     Ok(Other)
 }

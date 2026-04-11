@@ -57,6 +57,7 @@ pub fn apply_from_env() -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) -> crate::Result<()> {
     let rlim = libc::rlimit64 {
         rlim_cur: value,
@@ -65,6 +66,24 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) -> cr
     // SAFETY: prlimit64 with pid=0 targets the calling process.
     // The rlimit struct is valid and on the stack.
     let ret = unsafe { libc::prlimit64(0, resource, &rlim, std::ptr::null_mut()) };
+    if ret != 0 {
+        return Err(Error::Rlimit(format!(
+            "{name}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    log::debug!("rlimit: {name} = {value}");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_rlimit(resource: libc::c_int, value: u64, name: &str) -> crate::Result<()> {
+    let rlim = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // SAFETY: setrlimit with valid resource and rlimit struct.
+    let ret = unsafe { libc::setrlimit(resource, &rlim) };
     if ret != 0 {
         return Err(Error::Rlimit(format!(
             "{name}: {}",

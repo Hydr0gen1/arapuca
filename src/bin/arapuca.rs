@@ -42,29 +42,30 @@ fn main() {
         }
     }
 
-    // Parse sandbox config from environment.
-    let read_paths = env_paths("ARAPUCA_READ_PATHS");
-    let write_paths = env_paths("ARAPUCA_WRITE_PATHS");
-
-    let profile = arapuca::Profile {
-        read_paths,
-        write_paths,
-        ..Default::default()
-    };
-
     // Apply sandbox restrictions. Fail-closed: exit non-zero if any
     // step fails. The subprocess never runs unsandboxed.
 
-    // 1. Landlock filesystem restrictions.
-    if let Err(e) = arapuca::landlock::apply(&profile) {
-        eprintln!("arapuca: landlock: {e}");
-        std::process::exit(1);
-    }
+    // 1. Landlock filesystem restrictions (Linux only).
+    // 2. Seccomp BPF syscall filter (Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        let read_paths = env_paths("ARAPUCA_READ_PATHS");
+        let write_paths = env_paths("ARAPUCA_WRITE_PATHS");
 
-    // 2. Seccomp BPF syscall filter.
-    if let Err(e) = arapuca::seccomp::apply() {
-        eprintln!("arapuca: seccomp: {e}");
-        std::process::exit(1);
+        let profile = arapuca::Profile {
+            read_paths,
+            write_paths,
+            ..Default::default()
+        };
+
+        if let Err(e) = arapuca::landlock::apply(&profile) {
+            eprintln!("arapuca: landlock: {e}");
+            std::process::exit(1);
+        }
+        if let Err(e) = arapuca::seccomp::apply() {
+            eprintln!("arapuca: seccomp: {e}");
+            std::process::exit(1);
+        }
     }
 
     // 3. Resource limits from env vars.
@@ -73,15 +74,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    // 4. Pdeathsig — kill subprocess if parent dies.
-    // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter, no
-    // pointer arguments. Affects only the calling thread.
-    let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-    if ret != 0 {
-        eprintln!(
-            "arapuca: pdeathsig: {} (non-fatal)",
-            std::io::Error::last_os_error()
-        );
+    // 4. Pdeathsig — kill subprocess if parent dies (Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter, no
+        // pointer arguments. Affects only the calling thread.
+        let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if ret != 0 {
+            eprintln!(
+                "arapuca: pdeathsig: {} (non-fatal)",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
     // Strip ARAPUCA_* env vars so the agent can't inspect its own
@@ -142,6 +146,7 @@ fn main() {
 }
 
 /// Parse colon-separated paths from an environment variable.
+#[cfg(target_os = "linux")]
 fn env_paths(name: &str) -> Vec<PathBuf> {
     match std::env::var(name) {
         Ok(v) => arapuca::env::parse_paths(&v),

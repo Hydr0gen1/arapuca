@@ -44,12 +44,7 @@ impl Sandbox for Other {
             Error::Process(format!("start process: {e}"))
         })?;
 
-        Ok(Process {
-            child,
-            tmp_dir,
-            cgroup_path: None,
-            cgroup_mgr: None,
-        })
+        Ok(Process { child, tmp_dir })
     }
 
     fn available(&self) -> crate::Result<()> {

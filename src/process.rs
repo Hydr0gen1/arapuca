@@ -13,9 +13,11 @@ pub struct Process {
     pub(crate) child: std::process::Child,
     /// Sandbox-created temp directory (HOME for the subprocess).
     pub(crate) tmp_dir: PathBuf,
-    /// Cgroup cleanup closure (None if no cgroup).
+    /// Cgroup path (None if no cgroup). Linux only.
+    #[cfg(target_os = "linux")]
     pub(crate) cgroup_path: Option<PathBuf>,
-    /// Reference to the cgroup manager for stats/cleanup.
+    /// Reference to the cgroup manager for stats/cleanup. Linux only.
+    #[cfg(target_os = "linux")]
     pub(crate) cgroup_mgr: Option<std::sync::Arc<crate::cgroup::CgroupManager>>,
 }
 
@@ -37,11 +39,11 @@ impl Process {
     /// Must be called before `cleanup()` which destroys the cgroup.
     /// Returns zero values if cgroups are unavailable.
     pub fn resource_stats(&self) -> ResourceUsage {
+        #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
-            mgr.read_stats(path)
-        } else {
-            ResourceUsage::default()
+            return mgr.read_stats(path);
         }
+        ResourceUsage::default()
     }
 
     /// Read the OOM kill count from the agent's cgroup.
@@ -49,17 +51,18 @@ impl Process {
     /// Must be called before `cleanup()` which destroys the cgroup.
     /// Returns 0 if cgroups are unavailable.
     pub fn oom_count(&self) -> u32 {
+        #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
-            mgr.read_oom_events(path)
-        } else {
-            0
+            return mgr.read_oom_events(path);
         }
+        0
     }
 
     /// Clean up the sandbox temp directory and cgroup.
     ///
     /// Must only be called after `wait()` returns.
     pub fn cleanup(self) {
+        #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
             let _ = mgr.destroy(path);
         }

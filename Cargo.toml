@@ -14,12 +14,14 @@ name = "arapuca"
 path = "src/bin/arapuca.rs"
 
 [dependencies]
-landlock = "0.4"
 libc = "0.2"
 log = "0.4"
 nix = { version = "0.30", features = ["fs", "process", "sched", "signal", "user"] }
-seccompiler = "0.5"
 thiserror = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
 
 [dev-dependencies]
 env_logger = "0.11"
