@@ -1,0 +1,60 @@
+//! Platform-specific sandbox implementations.
+//!
+//! Each platform provides a [`Sandbox`] implementation that coordinates
+//! the available isolation primitives (Landlock, seccomp, cgroups, netns
+//! on Linux; sandbox-exec on macOS; degraded fallback elsewhere).
+
+use std::os::unix::io::RawFd;
+
+use crate::{Config, process::Process};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod other;
+
+#[cfg(target_os = "linux")]
+pub use linux::Linux;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub use other::Other;
+
+/// Platform-specific sandbox implementation.
+///
+/// Coordinates OS-level isolation primitives to launch sandboxed
+/// subprocesses.
+pub trait Sandbox: Send + Sync {
+    /// Launch a sandboxed subprocess with the given config.
+    ///
+    /// The subprocess inherits only the explicitly listed FDs (via
+    /// `extra_fds`) and a minimal environment. All other FDs have
+    /// CLOEXEC set.
+    fn launch(
+        &self,
+        cfg: &Config,
+        cmd: &str,
+        args: &[&str],
+        extra_fds: &[RawFd],
+    ) -> crate::Result<Process>;
+
+    /// Reports whether this sandbox implementation is available on
+    /// the current platform. Returns an error describing why if not.
+    fn available(&self) -> crate::Result<()>;
+
+    /// Probes whether network namespace isolation works on this system.
+    fn netns_available(&self) -> bool;
+
+    /// Reports whether cgroups v2 resource limits are available.
+    fn cgroups_available(&self) -> bool;
+}
+
+/// Create the appropriate sandbox for the current platform.
+#[cfg(target_os = "linux")]
+pub fn new() -> crate::Result<Linux> {
+    Linux::new()
+}
+
+/// Create the appropriate sandbox for the current platform (fallback).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn new() -> crate::Result<Other> {
+    Ok(Other)
+}

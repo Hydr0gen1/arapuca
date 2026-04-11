@@ -15,10 +15,14 @@ pub mod env;
 mod error;
 pub mod landlock;
 pub mod netns;
+pub mod platform;
+mod process;
 mod profile;
 pub mod rlimit;
 pub mod seccomp;
 mod validate;
+
+pub use process::Process;
 
 pub use error::Error;
 pub use profile::{Config, Profile, ResourceUsage};
