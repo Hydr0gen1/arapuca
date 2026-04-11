@@ -1,0 +1,32 @@
+[package]
+name = "arapuca"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Linux process sandbox: Landlock, seccomp BPF, cgroups v2, network namespace isolation"
+
+[lib]
+name = "arapuca"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "arapuca"
+path = "src/bin/arapuca.rs"
+
+[dependencies]
+landlock = "0.4"
+libc = "0.2"
+log = "0.4"
+nix = { version = "0.30", features = ["fs", "process", "sched", "signal", "user"] }
+seccompiler = "0.5"
+thiserror = "2"
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[build-dependencies]
+cbindgen = "0.28"
+
+[profile.release]
+lto = true
+strip = true
