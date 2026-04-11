@@ -68,3 +68,8 @@ pub fn new() -> crate::Result<Darwin> {
 pub fn new() -> crate::Result<Other> {
     Ok(Other)
 }
+
+/// Create a boxed sandbox for the C FFI (type-erased for platform agnosticism).
+pub fn new_boxed() -> crate::Result<Box<dyn Sandbox>> {
+    Ok(Box::new(new()?))
+}
