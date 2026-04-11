@@ -72,6 +72,73 @@ pub fn parse_paths(s: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Returns the path to the arapuca binary if it exists.
+///
+/// Looks next to the current executable first, then in PATH.
+/// Returns None if not found.
+pub fn wrapper_path() -> Option<PathBuf> {
+    // Look next to the current executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("arapuca");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Fall back to PATH.
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        let candidate = PathBuf::from(dir).join("arapuca");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build environment variables for the arapuca wrapper binary.
+///
+/// These configure Landlock paths and rlimits. Uses the `ARAPUCA_*`
+/// prefix so the wrapper strips them after applying.
+pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if !profile.read_paths.is_empty() {
+        let paths: Vec<String> = profile
+            .read_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        env.push(("ARAPUCA_READ_PATHS".into(), paths.join(":")));
+    }
+    if !profile.write_paths.is_empty() {
+        let paths: Vec<String> = profile
+            .write_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        env.push(("ARAPUCA_WRITE_PATHS".into(), paths.join(":")));
+    }
+    if profile.max_memory_mb > 0 {
+        env.push((
+            "ARAPUCA_RLIMIT_AS".into(),
+            (profile.max_memory_mb * 1024 * 1024).to_string(),
+        ));
+    }
+    if profile.max_pids > 0 {
+        env.push((
+            "ARAPUCA_RLIMIT_NPROC".into(),
+            profile.max_pids.to_string(),
+        ));
+    }
+    if profile.max_file_size_mb > 0 {
+        env.push((
+            "ARAPUCA_RLIMIT_FSIZE".into(),
+            (profile.max_file_size_mb * 1024 * 1024).to_string(),
+        ));
+    }
+    env
+}
+
 /// Create a temporary directory with a given prefix.
 fn tempfile_dir(prefix: &str) -> crate::Result<PathBuf> {
     let tmp = std::env::temp_dir();
