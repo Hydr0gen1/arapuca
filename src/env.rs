@@ -23,37 +23,42 @@ pub fn minimal_env(tmp_dir: &Path) -> Vec<(String, String)> {
 
 /// Create a temporary directory for the sandbox.
 ///
-/// The directory is created under the system temp dir with a name
-/// derived from the task ID. Returns the path to the created directory.
+/// The directory is created under the system temp dir with a random
+/// suffix to prevent symlink attacks and directory squatting.
 pub fn make_tmp_dir(task_id: &str) -> crate::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("arapuca-{task_id}"));
-    std::fs::create_dir_all(&dir)?;
-    // Restrict permissions to owner only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    let prefix = format!("arapuca-{task_id}-");
+    let dir = mkdtemp(&prefix)?;
     Ok(dir)
 }
 
 /// Create a socket directory for JSON-RPC communication.
 ///
-/// Creates a directory with mode 0700 for the control and LLM sockets.
+/// Creates a directory with mode 0700 and a random suffix for the
+/// control and LLM sockets.
 pub fn make_socket_dir() -> crate::Result<PathBuf> {
-    let dir = tempfile_dir("arapuca-sock")?;
-    Ok(dir)
+    mkdtemp("arapuca-sock-")
 }
 
 /// Canonicalize a list of paths, resolving symlinks and making them absolute.
 ///
-/// Paths that don't exist are silently dropped (they can't be used
-/// in Landlock rules anyway). This prevents symlink escape attacks
-/// where a crafted symlink inside a writable path points outside it.
+/// Prevents symlink escape attacks where a crafted symlink inside a
+/// writable path points outside it. For paths that don't exist, falls
+/// back to canonicalizing the parent directory + the final component
+/// (matching Go's behavior). Returns empty vec only if all paths fail.
 pub fn canonicalize_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths
         .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter_map(|p| {
+            // Try direct canonicalization first.
+            if let Ok(canon) = std::fs::canonicalize(p) {
+                return Some(canon);
+            }
+            // Fallback: canonicalize parent + append basename.
+            let parent = p.parent()?;
+            let name = p.file_name()?;
+            let canon_parent = std::fs::canonicalize(parent).ok()?;
+            Some(canon_parent.join(name))
+        })
         .collect()
 }
 
@@ -139,18 +144,29 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
     env
 }
 
-/// Create a temporary directory with a given prefix.
-fn tempfile_dir(prefix: &str) -> crate::Result<PathBuf> {
+/// Create a temporary directory with a random suffix using libc mkdtemp.
+///
+/// The `prefix` is prepended to the random suffix. The resulting
+/// directory has mode 0700 (set atomically by mkdtemp).
+fn mkdtemp(prefix: &str) -> crate::Result<PathBuf> {
     let tmp = std::env::temp_dir();
-    // Use mkdtemp-style unique naming.
-    let dir = tmp.join(format!("{prefix}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let template = format!("{}XXXXXX", tmp.join(prefix).display());
+    let mut template_bytes = template.into_bytes();
+    template_bytes.push(0); // null-terminate
+
+    // SAFETY: mkdtemp modifies the template in-place and creates the
+    // directory atomically with mode 0700. The buffer is valid and
+    // null-terminated.
+    let result = unsafe { libc::mkdtemp(template_bytes.as_mut_ptr().cast()) };
+    if result.is_null() {
+        return Err(crate::Error::Io(std::io::Error::last_os_error()));
     }
-    Ok(dir)
+
+    // Convert back to PathBuf (strip the null terminator).
+    template_bytes.pop(); // remove null
+    let path_str = String::from_utf8(template_bytes)
+        .map_err(|e| crate::Error::Process(format!("mkdtemp path: {e}")))?;
+    Ok(PathBuf::from(path_str))
 }
 
 #[cfg(test)]
@@ -200,13 +216,18 @@ mod tests {
 
     #[test]
     fn canonicalize_existing_paths() {
-        let paths = vec![PathBuf::from("/usr"), PathBuf::from("/nonexistent-xyz")];
+        let paths = vec![PathBuf::from("/usr"), PathBuf::from("/tmp/nonexistent-xyz")];
         let result = canonicalize_paths(&paths);
         assert!(result.contains(&PathBuf::from("/usr")));
-        assert!(
-            !result
-                .iter()
-                .any(|p| p.to_string_lossy().contains("nonexistent"))
-        );
+        // /tmp/nonexistent-xyz: parent /tmp exists, so fallback works.
+        assert!(result.len() == 2);
+    }
+
+    #[test]
+    fn canonicalize_fully_nonexistent() {
+        // Both parent and child don't exist — dropped.
+        let paths = vec![PathBuf::from("/no-such-parent-xyz/child")];
+        let result = canonicalize_paths(&paths);
+        assert!(result.is_empty());
     }
 }
