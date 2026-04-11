@@ -11,6 +11,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod error;
+pub mod landlock;
 mod profile;
 mod validate;
 
