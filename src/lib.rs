@@ -10,9 +10,12 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod env;
 mod error;
 pub mod landlock;
+pub mod netns;
 mod profile;
+pub mod rlimit;
 pub mod seccomp;
 mod validate;
 
