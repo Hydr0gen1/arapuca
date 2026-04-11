@@ -13,7 +13,7 @@
 //! Landlock, seccomp, and rlimits are applied by the arapuca wrapper
 //! binary at startup (before exec-ing the agent).
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -47,7 +47,7 @@ impl Sandbox for Linux {
         cfg: &Config,
         cmd: &str,
         args: &[&str],
-        _extra_fds: &[RawFd],
+        extra_fds: &[RawFd],
     ) -> crate::Result<Process> {
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
@@ -119,19 +119,70 @@ impl Sandbox for Linux {
             command.env(k, v);
         }
 
-        // Set stdout/stderr.
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
+        // Set stdout/stderr. Dup the FD so Rust doesn't take
+        // ownership of the caller's FD (from_raw_fd consumes it).
+        match cfg.stdout {
+            Some(fd) => {
+                // SAFETY: dup() on a valid fd returns a new fd we own.
+                let duped = unsafe { libc::dup(fd) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stdout fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stdout(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stdout(Stdio::inherit());
+            }
+        }
+        match cfg.stderr {
+            Some(fd) => {
+                let duped = unsafe { libc::dup(fd) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stderr fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stderr(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stderr(Stdio::inherit());
+            }
+        }
 
-        // Setsid: detach from host's terminal session.
-        // Pdeathsig: kill subprocess if parent dies.
-        // SAFETY: These are simple flag setters with no pointer arguments.
+        // Capture extra_fds for the pre_exec closure.
+        let fds_to_inherit: Vec<RawFd> = extra_fds.to_vec();
+
+        // SAFETY: pre_exec runs between fork and exec. Only
+        // async-signal-safe functions are permitted. We use raw libc
+        // calls (setsid, prctl, dup2, fcntl) — no std::fs or allocation.
         unsafe {
-            command.pre_exec(|| {
-                // Setsid.
+            command.pre_exec(move || {
+                // Setsid: detach from host's terminal session.
                 libc::setsid();
-                // Pdeathsig.
+                // Pdeathsig: kill subprocess if parent dies.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+
+                // Map extra FDs to deterministic positions (3, 4, ...).
+                // The Go orchestrator expects the nonce pipe at FD 3.
+                for (i, &fd) in fds_to_inherit.iter().enumerate() {
+                    let target_fd = (3 + i) as libc::c_int;
+                    if fd != target_fd {
+                        if libc::dup2(fd, target_fd) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        libc::close(fd);
+                    }
+                    // Clear CLOEXEC so the FD survives exec.
+                    let flags = libc::fcntl(target_fd, libc::F_GETFD);
+                    if flags != -1 {
+                        libc::fcntl(target_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                    }
+                }
+
                 Ok(())
             });
         }

@@ -4,7 +4,8 @@
 //! no seccomp, no cgroups, no network namespace. Suitable for development
 //! and testing only. Production workloads should use Linux.
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::platform::Sandbox;
@@ -19,7 +20,7 @@ impl Sandbox for Other {
         cfg: &Config,
         cmd: &str,
         args: &[&str],
-        _extra_fds: &[RawFd],
+        extra_fds: &[RawFd],
     ) -> crate::Result<Process> {
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
@@ -36,8 +37,60 @@ impl Sandbox for Other {
             command.env(k, v);
         }
 
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
+        // stdout/stderr redirection. Dup so Rust doesn't take caller's FD.
+        match cfg.stdout {
+            Some(fd) => {
+                let duped = unsafe { libc::dup(fd) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stdout fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stdout(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stdout(Stdio::inherit());
+            }
+        }
+        match cfg.stderr {
+            Some(fd) => {
+                let duped = unsafe { libc::dup(fd) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stderr fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stderr(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stderr(Stdio::inherit());
+            }
+        }
+
+        // Extra FD inheritance.
+        let fds_to_inherit: Vec<RawFd> = extra_fds.to_vec();
+        if !fds_to_inherit.is_empty() {
+            unsafe {
+                command.pre_exec(move || {
+                    for (i, &fd) in fds_to_inherit.iter().enumerate() {
+                        let target_fd = (3 + i) as libc::c_int;
+                        if fd != target_fd {
+                            if libc::dup2(fd, target_fd) == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            libc::close(fd);
+                        }
+                        let flags = libc::fcntl(target_fd, libc::F_GETFD);
+                        if flags != -1 {
+                            libc::fcntl(target_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let child = command.spawn().map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
