@@ -9,9 +9,36 @@
 #include <stdlib.h>
 
 /**
+ * Opaque launch config.
+ */
+typedef struct arapuca_ArapucaConfig arapuca_ArapucaConfig;
+
+/**
+ * Opaque process handle.
+ */
+typedef struct arapuca_ArapucaProcess arapuca_ArapucaProcess;
+
+/**
  * Opaque profile builder.
  */
 typedef struct arapuca_ArapucaProfile arapuca_ArapucaProfile;
+
+/**
+ * Opaque sandbox handle (platform-specific, type-erased).
+ */
+typedef struct arapuca_ArapucaSandbox arapuca_ArapucaSandbox;
+
+/**
+ * Resource usage statistics from cgroups v2.
+ */
+typedef struct arapuca_ArapucaResourceUsage {
+    int64_t memory_current_bytes;
+    int64_t memory_peak_bytes;
+    double cpu_usage_seconds;
+    int64_t pid_count;
+    int64_t io_read_bytes;
+    int64_t io_write_bytes;
+} arapuca_ArapucaResourceUsage;
 
 /**
  * Create a new profile builder.
@@ -22,9 +49,7 @@ struct arapuca_ArapucaProfile *arapuca_profile_new(void);
  * Add a read-only path to the profile. Returns 0 on success, -1 on error.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
- * `path` must be a valid null-terminated UTF-8 string.
+ * `profile` and `path` must be valid pointers.
  */
 int32_t arapuca_profile_add_read_path(struct arapuca_ArapucaProfile *profile,
                                         const char *path);
@@ -33,9 +58,7 @@ int32_t arapuca_profile_add_read_path(struct arapuca_ArapucaProfile *profile,
  * Add a read-write path to the profile. Returns 0 on success, -1 on error.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
- * `path` must be a valid null-terminated UTF-8 string.
+ * `profile` and `path` must be valid pointers.
  */
 int32_t arapuca_profile_add_write_path(struct arapuca_ArapucaProfile *profile,
                                          const char *path);
@@ -44,8 +67,7 @@ int32_t arapuca_profile_add_write_path(struct arapuca_ArapucaProfile *profile,
  * Set memory limit in MB.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
+ * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_memory_mb(struct arapuca_ArapucaProfile *profile, uint64_t mb);
 
@@ -53,8 +75,7 @@ void arapuca_profile_set_memory_mb(struct arapuca_ArapucaProfile *profile, uint6
  * Set CPU percentage limit.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
+ * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_cpu_pct(struct arapuca_ArapucaProfile *profile, uint32_t pct);
 
@@ -62,8 +83,7 @@ void arapuca_profile_set_cpu_pct(struct arapuca_ArapucaProfile *profile, uint32_
  * Set maximum PIDs.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
+ * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_max_pids(struct arapuca_ArapucaProfile *profile, uint32_t pids);
 
@@ -71,8 +91,7 @@ void arapuca_profile_set_max_pids(struct arapuca_ArapucaProfile *profile, uint32
  * Set maximum file size in MB (RLIMIT_FSIZE).
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
+ * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile,
                                             uint64_t mb);
@@ -81,29 +100,246 @@ void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile
  * Enable/disable network namespace isolation.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
+ * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_netns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
- * Free a profile. Safe to call with NULL or after a previous free.
+ * Free a profile. Safe to call with NULL.
  *
  * # Safety
- *
  * `profile` must be NULL or a valid pointer from `arapuca_profile_new()`.
  */
 void arapuca_profile_free(struct arapuca_ArapucaProfile *profile);
+
+/**
+ * Create a new sandbox for the current platform.
+ *
+ * Returns NULL on error (check `arapuca_last_error()`).
+ */
+struct arapuca_ArapucaSandbox *arapuca_sandbox_new(void);
+
+/**
+ * Check whether cgroups v2 resource limits are available.
+ *
+ * # Safety
+ * `sb` must be a valid pointer.
+ */
+bool arapuca_sandbox_cgroups_available(const struct arapuca_ArapucaSandbox *sb);
+
+/**
+ * Free a sandbox handle. Safe to call with NULL.
+ *
+ * # Safety
+ * `sb` must be NULL or a valid pointer from `arapuca_sandbox_new()`.
+ */
+void arapuca_sandbox_free(struct arapuca_ArapucaSandbox *sb);
+
+/**
+ * Create a new launch config.
+ */
+struct arapuca_ArapucaConfig *arapuca_config_new(void);
+
+/**
+ * Set the profile on a config (clones the profile).
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_config_set_profile(struct arapuca_ArapucaConfig *cfg,
+                                     const struct arapuca_ArapucaProfile *profile);
+
+/**
+ * Set the task ID on a config.
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_config_set_task_id(struct arapuca_ArapucaConfig *cfg, const char *task_id);
+
+/**
+ * Set the phase on a config.
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_config_set_phase(struct arapuca_ArapucaConfig *cfg, const char *phase);
+
+/**
+ * Set the socket directory on a config.
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_config_set_socket_dir(struct arapuca_ArapucaConfig *cfg, const char *dir);
+
+/**
+ * Set the working directory on a config.
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_config_set_work_dir(struct arapuca_ArapucaConfig *cfg, const char *dir);
+
+/**
+ * Set stdout FD on a config.
+ *
+ * # Safety
+ * `cfg` must be a valid pointer.
+ */
+void arapuca_config_set_stdout_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
+
+/**
+ * Set stderr FD on a config.
+ *
+ * # Safety
+ * `cfg` must be a valid pointer.
+ */
+void arapuca_config_set_stderr_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
+
+/**
+ * Set network proxy socket path on a config.
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_config_set_network_proxy(struct arapuca_ArapucaConfig *cfg, const char *path);
+
+/**
+ * Free a config. Safe to call with NULL.
+ *
+ * # Safety
+ * `cfg` must be NULL or a valid pointer from `arapuca_config_new()`.
+ */
+void arapuca_config_free(struct arapuca_ArapucaConfig *cfg);
+
+/**
+ * Launch a sandboxed subprocess.
+ *
+ * Returns NULL on error (check `arapuca_last_error()`).
+ *
+ * # Safety
+ * All pointers must be valid. `args` must have `args_count` entries.
+ * `extra_fds` must have `extra_fds_count` entries (or be NULL if 0).
+ */
+struct arapuca_ArapucaProcess *arapuca_launch(struct arapuca_ArapucaSandbox *sb,
+                                                    const struct arapuca_ArapucaConfig *cfg,
+                                                    const char *cmd,
+                                                    const char *const *args,
+                                                    uintptr_t args_count,
+                                                    const int32_t *extra_fds,
+                                                    uintptr_t extra_fds_count);
+
+/**
+ * Get the PID of a sandboxed process.
+ *
+ * # Safety
+ * `proc` must be a valid pointer.
+ */
+uint32_t arapuca_process_pid(const struct arapuca_ArapucaProcess *proc);
+
+/**
+ * Wait for a sandboxed process to exit.
+ *
+ * Returns:
+ * - `>= 0`: exit code
+ * - `< -1`: killed by signal (value = -signal_number)
+ * - `-1`: error (check `arapuca_last_error()`)
+ *
+ * # Safety
+ * `proc` must be a valid pointer.
+ */
+int32_t arapuca_process_wait(struct arapuca_ArapucaProcess *proc);
+
+/**
+ * Read resource usage from the process's cgroup.
+ *
+ * Must be called before `arapuca_process_cleanup()`.
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ * Both pointers must be valid.
+ */
+int32_t arapuca_process_resource_stats(const struct arapuca_ArapucaProcess *proc,
+                                         struct arapuca_ArapucaResourceUsage *out);
+
+/**
+ * Read OOM kill count from the process's cgroup.
+ *
+ * Must be called before `arapuca_process_cleanup()`.
+ *
+ * # Safety
+ * `proc` must be a valid pointer.
+ */
+uint32_t arapuca_process_oom_count(const struct arapuca_ArapucaProcess *proc);
+
+/**
+ * Clean up the sandbox temp directory and cgroup.
+ *
+ * Must only be called after `arapuca_process_wait()` returns.
+ * Consumes the process — subsequent calls on the same pointer are no-ops.
+ *
+ * # Safety
+ * `proc` must be a valid pointer.
+ */
+void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
 
 /**
  * Apply sandbox restrictions to the current process. Fail-closed.
  * Returns 0 on success, -1 on error.
  *
  * # Safety
- *
- * `profile` must be a valid pointer from `arapuca_profile_new()`.
+ * `profile` must be a valid pointer.
  */
 int32_t arapuca_apply(const struct arapuca_ArapucaProfile *profile);
+
+/**
+ * Create a socket directory (mode 0700, random suffix).
+ *
+ * Returns a path string. Caller MUST free with `arapuca_free_string()`.
+ * Returns NULL on error.
+ */
+char *arapuca_make_socket_dir(void);
+
+/**
+ * Create a temp directory for a task (random suffix).
+ *
+ * Returns a path string. Caller MUST free with `arapuca_free_string()`.
+ * Returns NULL on error.
+ *
+ * # Safety
+ * `task_id` must be a valid null-terminated string.
+ */
+char *arapuca_make_tmp_dir(const char *task_id);
+
+/**
+ * Find the arapuca wrapper binary.
+ *
+ * Returns the path or NULL if not found.
+ * Caller MUST free with `arapuca_free_string()`.
+ */
+char *arapuca_wrapper_path(void);
+
+/**
+ * Calculate disk usage of a directory in MB.
+ *
+ * Returns 0 on error or if the path doesn't exist.
+ *
+ * # Safety
+ * `path` must be a valid null-terminated string.
+ */
+uint64_t arapuca_disk_usage_mb(const char *path);
+
+/**
+ * Free a string returned by arapuca.
+ *
+ * MUST be used instead of `free()` — the string was allocated by
+ * Rust's allocator, not the C allocator.
+ *
+ * # Safety
+ * `s` must be NULL or a pointer returned by a arapuca function.
+ */
+void arapuca_free_string(char *s);
 
 /**
  * Probe the Landlock ABI version. Returns 0 if unavailable.
