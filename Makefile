@@ -1,4 +1,4 @@
-.PHONY: build release test lint fmt check audit header clean
+.PHONY: build release test lint fmt check audit header man clean
 
 build:
 	cargo build
@@ -28,6 +28,9 @@ audit:
 
 header:
 	cbindgen --config cbindgen.toml --crate arapuca --output include/arapuca.h
+
+man:
+	pandoc doc/arapuca.1.md -s -t man -o doc/arapuca.1
 
 clean:
 	cargo clean
