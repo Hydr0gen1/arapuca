@@ -14,6 +14,7 @@ pub mod cgroup;
 pub mod diskquota;
 pub mod env;
 mod error;
+pub mod ffi;
 pub mod landlock;
 pub mod netns;
 pub mod platform;
