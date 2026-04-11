@@ -135,11 +135,7 @@ fn main() {
 
         let ret = libc::execve(c_cmd.as_ptr(), argv.as_ptr(), envp.as_ptr());
         if ret == -1 {
-            eprintln!(
-                "arapuca: exec {}: {}",
-                cmd,
-                std::io::Error::last_os_error()
-            );
+            eprintln!("arapuca: exec {}: {}", cmd, std::io::Error::last_os_error());
             std::process::exit(1);
         }
     }

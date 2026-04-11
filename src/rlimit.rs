@@ -118,10 +118,6 @@ mod tests {
 
     #[test]
     fn parse_env_missing() {
-        assert!(
-            parse_env_u64("ARAPUCA_TEST_NONEXISTENT")
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_env_u64("ARAPUCA_TEST_NONEXISTENT").unwrap().is_none());
     }
 }

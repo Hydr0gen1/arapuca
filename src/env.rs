@@ -130,10 +130,7 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
         ));
     }
     if profile.max_pids > 0 {
-        env.push((
-            "ARAPUCA_RLIMIT_NPROC".into(),
-            profile.max_pids.to_string(),
-        ));
+        env.push(("ARAPUCA_RLIMIT_NPROC".into(), profile.max_pids.to_string()));
     }
     if profile.max_file_size_mb > 0 {
         env.push((

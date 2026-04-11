@@ -208,10 +208,7 @@ pub unsafe extern "C" fn arapuca_profile_set_max_file_size_mb(
 /// # Safety
 /// `profile` must be a valid pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn arapuca_profile_set_netns(
-    profile: *mut ArapucaProfile,
-    enabled: bool,
-) {
+pub unsafe extern "C" fn arapuca_profile_set_netns(profile: *mut ArapucaProfile, enabled: bool) {
     if let Some(profile) = unsafe { profile.as_mut() } {
         if let Some(inner) = profile.inner.as_mut() {
             inner.use_netns = enabled;
