@@ -10,6 +10,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod cgroup;
 pub mod env;
 mod error;
 pub mod landlock;
