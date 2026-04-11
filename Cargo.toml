@@ -7,7 +7,7 @@ description = "Linux process sandbox: Landlock, seccomp BPF, cgroups v2, network
 
 [lib]
 name = "arapuca"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]
 name = "arapuca"
