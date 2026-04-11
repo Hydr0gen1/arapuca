@@ -2,3 +2,7 @@
 *.swp
 *.swo
 *~
+staging/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
