@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Linux process sandbox: Landlock, seccomp BPF, cgroups v2, network namespace isolation"
+repository = "https://github.com/sergio-correia/arapuca"
+publish = false
 
 [lib]
 name = "arapuca"
