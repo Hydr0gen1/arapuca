@@ -8,14 +8,18 @@ use std::os::unix::io::RawFd;
 
 use crate::{Config, process::Process};
 
+#[cfg(target_os = "macos")]
+mod darwin;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod other;
 
+#[cfg(target_os = "macos")]
+pub use darwin::Darwin;
 #[cfg(target_os = "linux")]
 pub use linux::Linux;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use other::Other;
 
 /// Platform-specific sandbox implementation.
@@ -53,8 +57,14 @@ pub fn new() -> crate::Result<Linux> {
     Linux::new()
 }
 
+/// Create the appropriate sandbox for the current platform (macOS).
+#[cfg(target_os = "macos")]
+pub fn new() -> crate::Result<Darwin> {
+    Darwin::new()
+}
+
 /// Create the appropriate sandbox for the current platform (fallback).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn new() -> crate::Result<Other> {
     Ok(Other)
 }
