@@ -13,6 +13,7 @@
 mod error;
 pub mod landlock;
 mod profile;
+pub mod seccomp;
 mod validate;
 
 pub use error::Error;
