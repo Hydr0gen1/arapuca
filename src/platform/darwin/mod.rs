@@ -286,6 +286,9 @@ impl Sandbox for Darwin {
             ));
         }
 
+        // Append caller-supplied env vars (filtered for safety).
+        env_vars.extend(crate::env::filter_caller_env(&cfg.env));
+
         command.env_clear();
         for (k, v) in &env_vars {
             command.env(k, v);

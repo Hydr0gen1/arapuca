@@ -31,7 +31,8 @@ impl Sandbox for Other {
             command.current_dir(work_dir);
         }
 
-        let env_vars = crate::env::minimal_env(&tmp_dir);
+        let mut env_vars = crate::env::minimal_env(&tmp_dir);
+        env_vars.extend(crate::env::filter_caller_env(&cfg.env));
         command.env_clear();
         for (k, v) in &env_vars {
             command.env(k, v);

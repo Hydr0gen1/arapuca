@@ -211,6 +211,20 @@ int32_t arapuca_config_set_stderr_fd(struct arapuca_ArapucaConfig *cfg, int32_t 
 int32_t arapuca_config_set_network_proxy(struct arapuca_ArapucaConfig *cfg, const char *path);
 
 /**
+ * Add a caller-supplied environment variable to the config.
+ *
+ * Both key and value are validated (UTF-8, max 4096 bytes each).
+ * Dangerous env vars (ARAPUCA_*, LD_*, etc.) are filtered at
+ * launch time by the platform launcher, not here.
+ *
+ * # Safety
+ * All pointers must be valid.
+ */
+int32_t arapuca_config_add_env(struct arapuca_ArapucaConfig *cfg,
+                               const char *key,
+                               const char *value);
+
+/**
  * Free a config. Safe to call with NULL.
  *
  * # Safety

@@ -21,6 +21,36 @@ pub fn minimal_env(tmp_dir: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Filter caller-supplied env vars, dropping dangerous entries.
+///
+/// Drops vars that could subvert sandbox confinement:
+/// - `ARAPUCA_*` — sandbox config re-injection
+/// - `AGENT_NETWORK_PROXY` — set by launcher, not caller
+/// - `LD_*`, `DYLD_*` — dynamic linker injection
+/// - Interpreter injection: `BASH_ENV`, `ENV`, `PYTHONPATH`,
+///   `PYTHONSTARTUP`, `NODE_OPTIONS`, `PERL5OPT`, `PERL5LIB`
+pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    const BLOCKED_PREFIXES: &[&str] = &["ARAPUCA_", "LD_", "DYLD_"];
+    const BLOCKED_NAMES: &[&str] = &[
+        "AGENT_NETWORK_PROXY",
+        "BASH_ENV",
+        "ENV",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "NODE_OPTIONS",
+        "PERL5OPT",
+        "PERL5LIB",
+    ];
+
+    env.iter()
+        .filter(|(k, _)| {
+            !BLOCKED_PREFIXES.iter().any(|p| k.starts_with(p))
+                && !BLOCKED_NAMES.contains(&k.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 /// Create a temporary directory for the sandbox.
 ///
 /// The directory is created under the system temp dir with a random
@@ -209,6 +239,66 @@ mod tests {
     fn parse_paths_trims_whitespace() {
         let paths = parse_paths(" /usr : /lib ");
         assert_eq!(paths, vec![PathBuf::from("/usr"), PathBuf::from("/lib")]);
+    }
+
+    #[test]
+    fn filter_drops_arapuca_prefix() {
+        let env = vec![("ARAPUCA_READ_PATHS".into(), "/".into())];
+        assert!(filter_caller_env(&env).is_empty());
+    }
+
+    #[test]
+    fn filter_drops_ld_prefix() {
+        let env = vec![
+            ("LD_PRELOAD".into(), "/evil.so".into()),
+            ("LD_LIBRARY_PATH".into(), "/tmp".into()),
+        ];
+        assert!(filter_caller_env(&env).is_empty());
+    }
+
+    #[test]
+    fn filter_drops_dyld_prefix() {
+        let env = vec![("DYLD_INSERT_LIBRARIES".into(), "/evil.dylib".into())];
+        assert!(filter_caller_env(&env).is_empty());
+    }
+
+    #[test]
+    fn filter_drops_interpreter_injection() {
+        let blocked = vec![
+            "BASH_ENV", "ENV", "PYTHONPATH", "PYTHONSTARTUP",
+            "NODE_OPTIONS", "PERL5OPT", "PERL5LIB",
+        ];
+        let env: Vec<(String, String)> = blocked
+            .iter()
+            .map(|k| (k.to_string(), "malicious".into()))
+            .collect();
+        assert!(filter_caller_env(&env).is_empty());
+    }
+
+    #[test]
+    fn filter_drops_agent_network_proxy() {
+        let env = vec![("AGENT_NETWORK_PROXY".into(), "/tmp/evil.sock".into())];
+        assert!(filter_caller_env(&env).is_empty());
+    }
+
+    #[test]
+    fn filter_preserves_normal_vars() {
+        let env = vec![
+            ("MY_TOKEN".into(), "secret123".into()),
+            ("JIRA_URL".into(), "https://jira.example.com".into()),
+        ];
+        let filtered = filter_caller_env(&env);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].0, "MY_TOKEN");
+        assert_eq!(filtered[1].0, "JIRA_URL");
+    }
+
+    #[test]
+    fn filter_preserves_value_with_equals() {
+        let env = vec![("CONFIG".into(), "key=value=extra".into())];
+        let filtered = filter_caller_env(&env);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, "key=value=extra");
     }
 
     #[test]
