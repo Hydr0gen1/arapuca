@@ -286,6 +286,7 @@ pub extern "C" fn arapuca_config_new() -> *mut ArapucaConfig {
             stdout: None,
             stderr: None,
             network_proxy_socket: None,
+            env: Vec::new(),
         }),
     }))
 }
@@ -424,6 +425,47 @@ pub unsafe extern "C" fn arapuca_config_set_network_proxy(
             c.network_proxy_socket = Some(PathBuf::from(s));
         })
     }
+}
+
+/// Add a caller-supplied environment variable to the config.
+///
+/// Both key and value are validated (UTF-8, max 4096 bytes each).
+/// Dangerous env vars (ARAPUCA_*, LD_*, etc.) are filtered at
+/// launch time by the platform launcher, not here.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_config_add_env(
+    cfg: *mut ArapucaConfig,
+    key: *const c_char,
+    value: *const c_char,
+) -> i32 {
+    clear_error();
+    let Some(cfg) = (unsafe { cfg.as_mut() }) else {
+        set_error("null config pointer");
+        return -1;
+    };
+    let Some(inner) = cfg.inner.as_mut() else {
+        set_error("config already freed");
+        return -1;
+    };
+    let k = match unsafe { validate_cstr(key) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    let v = match unsafe { validate_cstr(value) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    inner.env.push((k, v));
+    0
 }
 
 /// Free a config. Safe to call with NULL.
@@ -957,6 +999,14 @@ mod tests {
             assert_eq!(arapuca_config_set_stdin_fd(cfg, -1), -1);
             assert_eq!(arapuca_config_set_stdout_fd(cfg, -1), -1);
             assert_eq!(arapuca_config_set_stderr_fd(cfg, -1), -1);
+
+            let key = CString::new("MY_TOKEN").unwrap();
+            let val = CString::new("secret123").unwrap();
+            assert_eq!(arapuca_config_add_env(cfg, key.as_ptr(), val.as_ptr()), 0);
+
+            let key2 = CString::new("CONFIG").unwrap();
+            let val2 = CString::new("a=b=c").unwrap();
+            assert_eq!(arapuca_config_add_env(cfg, key2.as_ptr(), val2.as_ptr()), 0);
 
             arapuca_profile_free(profile);
             arapuca_config_free(cfg);

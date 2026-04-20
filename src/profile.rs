@@ -45,6 +45,11 @@ pub struct Config {
     /// receives an env var pointing to this socket. Uses a non-ARAPUCA
     /// prefix so it is not stripped by the binary.
     pub network_proxy_socket: Option<PathBuf>,
+    /// Caller-supplied environment variables for the subprocess.
+    /// Filtered by the platform launcher before use: ARAPUCA_*,
+    /// LD_*, DYLD_*, and other dangerous names are silently dropped.
+    /// If the same key is added multiple times, the last value wins.
+    pub env: Vec<(String, String)>,
 }
 
 /// Resource usage statistics from cgroups v2.
