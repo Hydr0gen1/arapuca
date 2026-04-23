@@ -3,7 +3,7 @@ name = "arapuca"
 version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Linux process sandbox: Landlock, seccomp BPF, cgroups v2, network namespace isolation"
+description = "Cross-platform process sandbox: Landlock/seccomp/cgroups (Linux), Seatbelt (macOS), AppContainer/Job Objects (Windows)"
 repository = "https://github.com/sergio-correia/arapuca"
 publish = false
 

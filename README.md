@@ -1,9 +1,11 @@
 # Arapuca
 
-Process sandbox for Linux and macOS providing kernel-enforced isolation.
-On Linux: Landlock, seccomp BPF, cgroups v2, and network namespaces. On
-macOS: Apple's Seatbelt (`sandbox-exec`) with deny-default profiles.
-Available as a Rust library (with C FFI) and a CLI binary.
+Process sandbox for Linux, macOS, and Windows providing
+kernel-enforced isolation. On Linux: Landlock, seccomp BPF, cgroups v2,
+and network namespaces. On macOS: Apple's Seatbelt (`sandbox-exec`)
+with deny-default profiles. On Windows: AppContainers, Job Objects,
+restricted tokens, and process mitigation policies. Available as a Rust
+library (with C FFI) and a CLI binary.
 
 Arapuca is designed for running **untrusted code** — even a fully
 compromised subprocess is contained by OS-level restrictions that cannot
@@ -35,15 +37,43 @@ be bypassed from userspace.
 - Skips `RLIMIT_AS` on Apple Silicon (causes immediate SIGKILL due
   to macOS virtual memory behavior)
 
-### Both platforms
+### Windows
 
-- **Resource limits** — RLIMIT_AS, RLIMIT_NPROC, RLIMIT_CPU,
-  RLIMIT_FSIZE
+- **AppContainer** — deny-by-default filesystem and network isolation;
+  only explicitly granted paths are accessible to the subprocess
+- **Job Object** — memory, CPU, and PID limits with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (all processes killed when
+  the parent exits or crashes)
+- **Restricted token** — `DISABLE_MAX_PRIVILEGE` strips all privileges;
+  Low Integrity level (S-1-16-4096) prevents writes to higher-integrity
+  objects. Used as fallback when AppContainer is not active.
+- **Process mitigation policies** — DEP, mandatory ASLR, high-entropy
+  ASLR, heap terminate on corruption, strict handle checks, Win32k
+  syscall disable, extension point disable, remote image load block
+- **Child process restriction** — optional
+  `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` blocks the subprocess
+  from spawning its own children (when `allow_exec` is false)
+- **UI restrictions** — blocks desktop, clipboard, display settings,
+  global atoms, and exit-windows access
+- **Explicit handle inheritance** —
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` ensures only stdio handles are
+  inherited; no handle leak to the subprocess
+- **DACL rollback** — original filesystem permissions are saved before
+  granting AppContainer access and restored during cleanup
+
+### All platforms
+
+- **Resource limits** — memory, CPU, PIDs (POSIX rlimits on
+  Linux/macOS; Job Objects on Windows)
 - **Process lifecycle** — launch, wait, resource stats, cleanup
 - **C FFI** — shared library with C header for integration from
-  C/C++/Go/Python
+  C/C++/Go/Python (`.so` on Linux, `.dylib` on macOS, `.dll` on
+  Windows)
 - **Fail-closed** — if any restriction fails to apply, the process
   exits before running the target command
+- **Environment hardening** — dangerous variables (`ARAPUCA_*`,
+  `LD_*`, `DYLD_*`, `.NET`/`COR_*` prefixes, interpreter injection
+  vectors, Windows shell variables) are filtered before exec
 
 ## Quick Start
 
@@ -72,8 +102,8 @@ ARAPUCA_WRITE_PATHS="/tmp/workspace" \
 
 | Variable | Description |
 |----------|-------------|
-| `ARAPUCA_READ_PATHS` | Colon-separated readable paths |
-| `ARAPUCA_WRITE_PATHS` | Colon-separated writable paths |
+| `ARAPUCA_READ_PATHS` | Readable paths (`:` on Unix, `;` on Windows) |
+| `ARAPUCA_WRITE_PATHS` | Writable paths (`:` on Unix, `;` on Windows) |
 | `ARAPUCA_RLIMIT_AS` | Max virtual memory in bytes |
 | `ARAPUCA_RLIMIT_NPROC` | Max number of processes |
 | `ARAPUCA_RLIMIT_CPU` | Max CPU time in seconds |
@@ -106,7 +136,7 @@ let config = arapuca::Config {
     ..Default::default() // stdout, stderr, network_proxy_socket
 };
 
-let mut process = sandbox.launch(&config, "/usr/bin/python3", &["agent.py"], &[])?;
+let mut process = sandbox.launch(&config, "/usr/bin/python3", &["agent.py"])?;
 let status = process.wait()?;
 let stats = process.resource_stats();
 println!("peak memory: {} bytes", stats.memory_peak_bytes);
@@ -118,7 +148,7 @@ process.cleanup();
 Build the shared library and generate the header:
 
 ```bash
-cargo build --release  # produces libarapuca.so (Linux) or .dylib (macOS)
+cargo build --release  # produces .so (Linux), .dylib (macOS), or .dll (Windows)
 make header            # generates include/arapuca.h
 ```
 
@@ -176,6 +206,20 @@ case.
 | Setsid | Session detach | Signal propagation to host terminal |
 | Env stripping | Remove ARAPUCA_* | Agent inspecting its own sandbox config |
 
+### Defense Layers (Windows)
+
+| Layer | Mechanism | What it prevents |
+|-------|-----------|------------------|
+| AppContainer | CreateAppContainerProfile | Filesystem/network access outside allowlist (deny-by-default) |
+| Job Object | KILL_ON_JOB_CLOSE | Memory exhaustion, fork bombs, CPU starvation, orphan processes |
+| Restricted token | DISABLE_MAX_PRIVILEGE + Low IL | Privilege escalation (fallback when AppContainer inactive) |
+| Mitigations | PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY | DEP bypass, ASLR bypass, Win32k attacks, DLL injection |
+| Child process restriction | MITIGATION_POLICY QWORD2 | Subprocess spawning children (when allow_exec=false) |
+| UI restrictions | JOBOBJECT_BASIC_UI_RESTRICTIONS | Desktop, clipboard, display settings, global atoms access |
+| Handle inheritance | PROC_THREAD_ATTRIBUTE_HANDLE_LIST | Handle leak to subprocess (only stdio inherited) |
+| DACL rollback | Save/restore ACLs | Persistent permission changes surviving sandbox exit |
+| Env stripping | Filter ARAPUCA_*, COMSPEC, __COMPAT_LAYER, etc. | Config inspection, shell injection, compat shim injection |
+
 ### Seccomp Filter (Linux only)
 
 Two tiers with different responses:
@@ -225,11 +269,11 @@ traffic must flow through a host-side proxy via Unix domain sockets.
 
 **How it works per platform:**
 
-| | Linux | macOS |
-|-|-------|-------|
-| Block IP | Seccomp returns `EPERM` for `socket(AF_INET/AF_INET6)`. Optionally `CLONE_NEWNET` removes all network interfaces. | Seatbelt `(deny default)` blocks all TCP/UDP. |
-| Allow Unix sockets | Seccomp does not filter `AF_UNIX` — passes through. | `(allow network-outbound (remote unix))` plus literal file access on each socket path. |
-| Proxy socket delivery | `AGENT_NETWORK_PROXY` env var (not stripped). | Same. |
+| | Linux | macOS | Windows |
+|-|-------|-------|---------|
+| Block IP | Seccomp returns `EPERM` for `socket(AF_INET/AF_INET6)`. Optionally `CLONE_NEWNET` removes all network interfaces. | Seatbelt `(deny default)` blocks all TCP/UDP. | AppContainer denies network by default. `internetClient` capability granted only when `use_netns` is false. |
+| Allow Unix sockets | Seccomp does not filter `AF_UNIX` — passes through. | `(allow network-outbound (remote unix))` plus literal file access on each socket path. | Named pipes / Unix sockets accessible if DACL grants access. |
+| Proxy socket delivery | `AGENT_NETWORK_PROXY` env var (not stripped). | Same. | Same. |
 
 The `AGENT_NETWORK_PROXY` env var deliberately avoids the `ARAPUCA_`
 prefix so it survives the wrapper binary's environment sanitization.
@@ -248,13 +292,15 @@ Arapuca provides two interfaces:
 - **Binary** (`arapuca -- cmd [args...]`): A wrapper that applies
   restrictions to itself, then `execve()`s the target command. Used by
   the library as a subprocess wrapper for Landlock/seccomp/rlimit
-  enforcement.
+  enforcement (Unix only — not used on Windows).
 
 The library spawns sandboxed processes by composing platform-specific
 isolation primitives. On Linux, the binary acts as an inner wrapper
 (Landlock + seccomp + rlimits applied before exec). On macOS,
 `sandbox-exec` provides the kernel policy and the binary applies only
-rlimits.
+rlimits. On Windows, `CreateProcessW` with an extended attribute list
+applies all restrictions atomically at process creation — no wrapper
+binary is needed.
 
 ### Platform Abstraction
 
@@ -262,8 +308,8 @@ The `Sandbox` trait defines the platform contract:
 
 ```rust
 pub trait Sandbox: Send + Sync {
-    fn launch(&self, cfg: &Config, cmd: &str, args: &[&str],
-              extra_fds: &[RawFd]) -> Result<Process>;
+    fn launch(&self, cfg: &Config, cmd: &str, args: &[&str])
+        -> Result<Process>;
     fn available(&self) -> Result<()>;
     fn netns_available(&self) -> bool;
     fn cgroups_available(&self) -> bool;
@@ -280,30 +326,39 @@ Library (host process)
 │
 ├─ Validate inputs (task ID, cgroup paths)
 ├─ Create temp dir (HOME/TMPDIR for subprocess)
-├─ [Linux] Create cgroup, set limits
-├─ [macOS] Generate Seatbelt .sb profile
+├─ [Linux]   Create cgroup, set limits
+├─ [macOS]   Generate Seatbelt .sb profile
+├─ [Windows] Create Job Object, set limits + UI restrictions
+├─ [Windows] Create AppContainer profile, grant DACL access
 │
-├─ Spawn subprocess ──────────────────────────────┐
-│   ├─ [Linux]  unshare --net (if netns)          │
-│   ├─ [Linux]  arapuca binary wrapper            │
-│   │           ├─ Apply Landlock (fs allowlist)  │
-│   │           ├─ Apply seccomp (syscall filter) │
-│   │           ├─ Apply rlimits                  │
-│   │           ├─ Set PR_SET_PDEATHSIG           │
-│   │           ├─ Strip ARAPUCA_* env            │
-│   │           └─ execve(target)                 │
-│   ├─ [macOS]  sandbox-exec -f profile.sb        │
-│   │           └─ [arapuca wrapper for rlimits]  │
-│   │               └─ execve(target)             │
-│   └─ setsid (both platforms)                    │
-│                                                 │
-├─ [Linux] Add PID to cgroup                      │
-├─ [macOS] Start memory monitor thread            │
-├─ [macOS] Start parent-PID watchdog thread       │
-│                                                 │
-├─ wait() ← blocks until subprocess exits ────────┘
+├─ Spawn subprocess ───────────────────────────────┐
+│   ├─ [Linux]   unshare --net (if netns)          │
+│   ├─ [Linux]   arapuca binary wrapper            │
+│   │            ├─ Apply Landlock (fs allowlist)  │
+│   │            ├─ Apply seccomp (syscall filter) │
+│   │            ├─ Apply rlimits                  │
+│   │            ├─ Set PR_SET_PDEATHSIG           │
+│   │            ├─ Strip ARAPUCA_* env            │
+│   │            └─ execve(target)                 │
+│   ├─ [macOS]   sandbox-exec -f profile.sb        │
+│   │            └─ [arapuca wrapper for rlimits]  │
+│   │                └─ execve(target)             │
+│   ├─ [Windows] CreateProcessW with attributes:   │
+│   │            ├─ PROC_THREAD_ATTRIBUTE_JOB_LIST │
+│   │            ├─ HANDLE_LIST (stdio only)       │
+│   │            ├─ MITIGATION_POLICY              │
+│   │            └─ SECURITY_CAPABILITIES          │
+│   │                (AppContainer SID)            │
+│   └─ [Unix]    setsid                            │
+│                                                  │
+├─ [Linux]   Add PID to cgroup                     │
+├─ [macOS]   Start memory monitor thread           │
+├─ [macOS]   Start parent-PID watchdog thread      │
+│                                                  │
+├─ wait() ← blocks until subprocess exits ─────────┘
 ├─ resource_stats() ← read cgroup stats (Linux)
-└─ cleanup() ← destroy cgroup, remove temp dir
+└─ cleanup() ← destroy cgroup/Job Object/AppContainer,
+               restore DACLs, remove temp dir
 ```
 
 ### Security Invariants
@@ -315,7 +370,7 @@ explicit security review:
    exits non-zero. The subprocess never runs unsandboxed.
 2. **PR_SET_NO_NEW_PRIVS** — called before Landlock and seccomp
    (Linux). Prevents privilege escalation via setuid binaries.
-3. **Setsid** — subprocess detached from host terminal session.
+3. **Setsid** — subprocess detached from host terminal session (Unix).
 4. **Cgroup path rejection** — `/sys/fs/cgroup` blocked in read/write
    paths to prevent the subprocess from manipulating its own limits.
 5. **Task ID sanitization** — `^[a-zA-Z0-9-]+$`, max 128 chars.
@@ -324,6 +379,15 @@ explicit security review:
    subprocess cannot inspect its own sandbox configuration.
 7. **Path validation (macOS)** — strict character allowlist for Seatbelt
    profile paths prevents profile injection attacks.
+8. **Atomic Job assignment (Windows)** —
+   `PROC_THREAD_ATTRIBUTE_JOB_LIST` assigns the Job Object during
+   `CreateProcessW`, preventing any window where the process runs
+   outside the Job.
+9. **DACL restoration (Windows)** — filesystem permissions granted to
+   the AppContainer SID are restored to their original state during
+   cleanup, even on error paths.
+10. **Kill-on-close (Windows)** — `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    ensures all processes in the Job are killed if the parent crashes.
 
 ### Environment Variable Convention
 
@@ -349,6 +413,7 @@ block has a `// SAFETY:` comment. Expected `unsafe` locations:
 | `cgroup.rs` | `libc::kill` for SIGKILL |
 | `platform/linux.rs` | `pre_exec()` for setsid + pdeathsig |
 | `platform/darwin/mod.rs` | `pre_exec()` for setsid, `kill()` for monitors |
+| `platform/windows.rs` | Win32 API calls: `CreateProcessW`, `CreateJobObjectW`, `CreateRestrictedToken`, `SetTokenInformation`, `DuplicateHandle`, DACL/ACL operations, `NtSetInformationProcess` |
 | `bin/arapuca.rs` | `libc::prctl`, `libc::execve` |
 
 ## Building
@@ -378,6 +443,8 @@ cargo fmt --check
   kernels; cgroups v2 with delegated controllers (for resource limits)
 - **macOS**: `sandbox-exec` (ships with macOS, deprecated but functional
   through macOS 15)
+- **Windows**: Windows 10+ (64-bit only) — AppContainers require
+  user-mode profile creation (no admin required)
 
 ## Project Structure
 
@@ -402,6 +469,7 @@ src/
 │   ├── darwin/
 │   │   ├── mod.rs      # macOS sandbox (sandbox-exec + monitors)
 │   │   └── darwin_profile.rs  # Seatbelt .sb profile generation
+│   ├── windows.rs      # Windows sandbox (AppContainer + Job Object)
 │   └── other.rs        # Degraded fallback (other Unix)
 ├── bin/
 │   └── arapuca.rs    # CLI binary
