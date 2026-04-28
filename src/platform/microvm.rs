@@ -15,6 +15,12 @@ use crate::audit::{
 use crate::platform::Sandbox;
 use crate::{Config, Error, Isolation, MicroVmConfig, Process};
 
+/// A host↔guest path pair for a virtiofs volume mount.
+pub(crate) struct VolumeMapping {
+    pub host: PathBuf,
+    pub guest: PathBuf,
+}
+
 /// Optional parameters for persistent VM launches (vsock + agent).
 pub(crate) struct PersistentVmOpts<'a> {
     /// Directory containing the agent binary (mounted read-only at /agent).
@@ -230,13 +236,32 @@ impl Sandbox for MicroVm {
                 String::new()
             };
 
+            let read_vols: Vec<VolumeMapping> = cfg
+                .profile
+                .read_paths
+                .iter()
+                .map(|p| VolumeMapping {
+                    host: p.clone(),
+                    guest: p.clone(),
+                })
+                .collect();
+            let write_vols: Vec<VolumeMapping> = cfg
+                .profile
+                .write_paths
+                .iter()
+                .map(|p| VolumeMapping {
+                    host: p.clone(),
+                    guest: p.clone(),
+                })
+                .collect();
+
             let mut process = launch_vm(
                 vm_cfg,
                 &overlay_path,
                 &ci_dir,
                 &cached.metadata,
-                &cfg.profile.read_paths,
-                &cfg.profile.write_paths,
+                &read_vols,
+                &write_vols,
                 &full_cmd,
                 &cfg.env,
                 net_fd,
@@ -289,8 +314,8 @@ fn launch_vm(
     overlay_path: &std::path::Path,
     ci_dir: &std::path::Path,
     meta: &crate::images::ImageMetadata,
-    read_paths: &[PathBuf],
-    write_paths: &[PathBuf],
+    read_vols: &[VolumeMapping],
+    write_vols: &[VolumeMapping],
     cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
@@ -337,8 +362,8 @@ fn launch_vm(
             overlay_path,
             ci_dir,
             meta,
-            read_paths,
-            write_paths,
+            read_vols,
+            write_vols,
             cmd,
             env,
             net_fd,
@@ -376,8 +401,8 @@ pub(crate) fn exec_vm(
     overlay_path: &std::path::Path,
     ci_dir: &std::path::Path,
     meta: &crate::images::ImageMetadata,
-    read_paths: &[PathBuf],
-    write_paths: &[PathBuf],
+    read_vols: &[VolumeMapping],
+    write_vols: &[VolumeMapping],
     cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
@@ -389,8 +414,8 @@ pub(crate) fn exec_vm(
         overlay_path,
         ci_dir,
         meta,
-        read_paths,
-        write_paths,
+        read_vols,
+        write_vols,
         cmd,
         env,
         net_fd,
@@ -409,8 +434,8 @@ fn exec_vm_inner(
     overlay_path: &std::path::Path,
     ci_dir: &std::path::Path,
     meta: &crate::images::ImageMetadata,
-    read_paths: &[PathBuf],
-    write_paths: &[PathBuf],
+    read_vols: &[VolumeMapping],
+    write_vols: &[VolumeMapping],
     cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
@@ -489,22 +514,22 @@ fn exec_vm_inner(
         return Err(Error::MicroVm("krun_add_virtiofs (cidata) failed".into()));
     }
 
-    // Add read-only paths as virtio-fs shares.
-    for (i, path) in read_paths.iter().enumerate() {
+    // Add read-only paths as virtio-fs shares (host paths).
+    for (i, vol) in read_vols.iter().enumerate() {
         let tag = CString::new(format!("ro{i}")).unwrap();
-        let host = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Error::MicroVm(format!("invalid read path: {}", path.display())))?;
+        let host = CString::new(vol.host.as_os_str().as_bytes())
+            .map_err(|_| Error::MicroVm(format!("invalid read path: {}", vol.host.display())))?;
         let ret = unsafe { krun_sys::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()) };
         if ret < 0 {
             return Err(Error::MicroVm(format!("krun_add_virtiofs (ro{i}) failed")));
         }
     }
 
-    // Add read-write paths as virtio-fs shares.
-    for (i, path) in write_paths.iter().enumerate() {
+    // Add read-write paths as virtio-fs shares (host paths).
+    for (i, vol) in write_vols.iter().enumerate() {
         let tag = CString::new(format!("rw{i}")).unwrap();
-        let host = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Error::MicroVm(format!("invalid write path: {}", path.display())))?;
+        let host = CString::new(vol.host.as_os_str().as_bytes())
+            .map_err(|_| Error::MicroVm(format!("invalid write path: {}", vol.host.display())))?;
         let ret = unsafe { krun_sys::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()) };
         if ret < 0 {
             return Err(Error::MicroVm(format!("krun_add_virtiofs (rw{i}) failed")));
@@ -608,17 +633,17 @@ fn exec_vm_inner(
     // Mount the cloud-init data directory.
     init_script.push_str("mkdir -p /cidata && mount -t virtiofs cidata /cidata\n");
 
-    // Mount read-only shares.
-    for (i, path) in read_paths.iter().enumerate() {
-        let gp = shell_quote(&path.to_string_lossy());
+    // Mount read-only shares (guest paths).
+    for (i, vol) in read_vols.iter().enumerate() {
+        let gp = shell_quote(&vol.guest.to_string_lossy());
         init_script.push_str(&format!(
             "mkdir -p {gp} && mount -t virtiofs -o ro ro{i} {gp}\n"
         ));
     }
 
-    // Mount read-write shares.
-    for (i, path) in write_paths.iter().enumerate() {
-        let gp = shell_quote(&path.to_string_lossy());
+    // Mount read-write shares (guest paths).
+    for (i, vol) in write_vols.iter().enumerate() {
+        let gp = shell_quote(&vol.guest.to_string_lossy());
         init_script.push_str(&format!("mkdir -p {gp} && mount -t virtiofs rw{i} {gp}\n"));
     }
 

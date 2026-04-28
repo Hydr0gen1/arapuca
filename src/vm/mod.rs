@@ -165,14 +165,31 @@ pub fn start(opts: &StartOpts) -> crate::Result<StartResult> {
                 max_lifetime: opts.max_lifetime,
             };
 
+            // Build volume lists: host paths for virtiofs, guest
+            // paths for init script mount points.
+            use crate::platform::microvm::VolumeMapping;
+            let mut read_vols = Vec::new();
+            let mut write_vols = Vec::new();
+            for v in &opts.volumes {
+                let vol = VolumeMapping {
+                    host: PathBuf::from(&v.host),
+                    guest: PathBuf::from(&v.guest),
+                };
+                if v.read_only {
+                    read_vols.push(vol);
+                } else {
+                    write_vols.push(vol);
+                }
+            }
+
             // exec_vm never returns — it replaces the process.
             exec_vm(
                 &vm_cfg,
                 &overlay_path,
                 &ci_dir,
                 &cached.metadata,
-                &[],
-                &[],
+                &read_vols,
+                &write_vols,
                 "",
                 &[],
                 net_fd,
