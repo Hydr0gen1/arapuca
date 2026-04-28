@@ -623,13 +623,6 @@ fn exec_vm_inner(
     init_script.push_str("mount -t tmpfs tmpfs /run\n");
     init_script.push_str("mkdir -p /run/lock\n");
 
-    // Workaround: libkrun's kernel lacks CONFIG_AUDIT, which makes
-    // Fedora's sudo (compiled with --with-linux-audit) refuse to run.
-    // Shadow it with a wrapper that delegates to su.
-    init_script.push_str(
-        "printf '#!/bin/sh\\nexec su -c \"$*\"\\n' > /usr/local/bin/sudo && chmod 755 /usr/local/bin/sudo\n",
-    );
-
     // Mount the cloud-init data directory.
     init_script.push_str("mkdir -p /cidata && mount -t virtiofs cidata /cidata\n");
 

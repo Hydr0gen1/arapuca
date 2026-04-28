@@ -32,25 +32,6 @@ struct SockaddrVm {
 
 const _: () = assert!(std::mem::size_of::<SockaddrVm>() == 16);
 
-// ─── capability structs ───────────────────────────────────────
-
-#[repr(C)]
-struct CapHeader {
-    version: u32,
-    pid: i32,
-}
-
-#[repr(C)]
-struct CapData {
-    effective: u32,
-    permitted: u32,
-    inheritable: u32,
-}
-
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
-const CAP_SETGID: u32 = 6;
-const CAP_SETUID: u32 = 7;
-
 // ─── main ─────────────────────────────────────────────────────
 
 fn main() {
@@ -61,7 +42,11 @@ fn main() {
 
     let listener_fd = create_vsock_listener(AGENT_VSOCK_PORT);
 
-    drop_capabilities();
+    // KVM is the security boundary — don't drop capabilities inside
+    // the guest. Restricting guest caps breaks virtiofs writes (needs
+    // CAP_DAC_OVERRIDE) and sudo (needs CAP_AUDIT_WRITE) without
+    // adding security, since an attacker who compromises the guest
+    // targets KVM escape, not capability escalation within the VM.
 
     if let Ok(content) = std::fs::read_to_string("/cidata/max_lifetime") {
         if let Ok(secs) = content.trim().parse::<libc::c_uint>() {
@@ -175,58 +160,6 @@ fn create_vsock_listener(port: u32) -> RawFd {
     }
 
     fd
-}
-
-fn drop_capabilities() {
-    // SAFETY: prctl calls are simple setters with integer arguments.
-    unsafe {
-        let ret = libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        );
-        if ret != 0 {
-            eprintln!("agent: PR_CAP_AMBIENT_CLEAR_ALL failed");
-            std::process::exit(1);
-        }
-
-        for cap in 0u64..64 {
-            if cap != u64::from(CAP_SETGID) && cap != u64::from(CAP_SETUID) {
-                let ret = libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
-                // EINVAL = cap doesn't exist on this kernel (fine).
-                if ret != 0 && *libc::__errno_location() != libc::EINVAL {
-                    eprintln!("agent: PR_CAPBSET_DROP({cap}) failed");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-
-    let mask: u32 = (1 << CAP_SETGID) | (1 << CAP_SETUID);
-    let hdr = CapHeader {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let data = [
-        CapData {
-            effective: mask,
-            permitted: mask,
-            inheritable: 0,
-        },
-        CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        },
-    ];
-    // SAFETY: capset with well-formed v3 header and two-element data array.
-    let ret = unsafe { libc::syscall(libc::SYS_capset, &hdr as *const _, data.as_ptr()) };
-    if ret != 0 {
-        eprintln!("agent: capset failed: {}", io::Error::last_os_error());
-        std::process::exit(1);
-    }
 }
 
 fn install_alarm_handler() {
@@ -624,7 +557,6 @@ unsafe fn exec_child(
             }
         }
 
-        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         libc::execve(c_cmd.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
         libc::_exit(127);
     }
