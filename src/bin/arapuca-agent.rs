@@ -40,13 +40,14 @@ fn main() {
     // SAFETY: prctl with PR_SET_CHILD_SUBREAPER is a simple setter.
     unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
 
-    let listener_fd = create_vsock_listener(AGENT_VSOCK_PORT);
+    install_sigchld_handler();
 
-    // KVM is the security boundary — don't drop capabilities inside
-    // the guest. Restricting guest caps breaks virtiofs writes (needs
-    // CAP_DAC_OVERRIDE) and sudo (needs CAP_AUDIT_WRITE) without
-    // adding security, since an attacker who compromises the guest
-    // targets KVM escape, not capability escalation within the VM.
+    // KVM is the security boundary — capabilities are not dropped
+    // inside the guest. Restricting guest caps breaks virtiofs writes
+    // (CAP_DAC_OVERRIDE) and sudo (CAP_AUDIT_WRITE) without adding
+    // security, since the VM boundary is hardware-enforced.
+
+    let listener_fd = create_vsock_listener(AGENT_VSOCK_PORT);
 
     if let Ok(content) = std::fs::read_to_string("/cidata/max_lifetime") {
         if let Ok(secs) = content.trim().parse::<libc::c_uint>() {
@@ -160,6 +161,21 @@ fn create_vsock_listener(port: u32) -> RawFd {
     }
 
     fd
+}
+
+fn install_sigchld_handler() {
+    extern "C" fn sigchld_handler(_sig: libc::c_int) {}
+    // Empty handler interrupts poll() so session threads wake up
+    // and check their child via waitpid(child_pid, WNOHANG).
+    // We must NOT call waitpid(-1) here — that races with the
+    // per-session waitpid. Orphaned grandchildren are drained by
+    // each session thread after its own child is reaped.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigchld_handler as *const () as usize;
+        sa.sa_flags = libc::SA_NOCLDSTOP;
+        libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
+    }
 }
 
 fn install_alarm_handler() {
@@ -474,8 +490,11 @@ fn handle_exec_tty(
         return 126;
     }
 
-    // SAFETY: set FD_CLOEXEC on master immediately.
-    unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: set FD_CLOEXEC on master and slave immediately.
+    unsafe {
+        libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+    };
 
     // Set initial window size if provided.
     if req.rows > 0 && req.cols > 0 {
@@ -541,6 +560,12 @@ unsafe fn exec_child(
     user_info: Option<&UserInfo>,
 ) -> ! {
     unsafe {
+        // Own process group so drain_orphans(-child_pid) only reaps
+        // this child's descendants, not other sessions' children.
+        // Redundant in TTY mode (setsid already sets pgid=pid) but
+        // load-bearing for pipe mode.
+        libc::setpgid(0, 0);
+
         for fd in 3..1024 {
             libc::close(fd);
         }
@@ -716,7 +741,6 @@ fn forward_io(
 
         // Check child status (non-blocking).
         if !child_exited {
-            // SAFETY: child_pid is valid, wstatus is stack-local.
             let ret = unsafe { libc::waitpid(child_pid, &mut wstatus, libc::WNOHANG) };
             if ret > 0 {
                 child_exited = true;
@@ -724,15 +748,16 @@ fn forward_io(
         }
 
         if child_exited && stdout_done && stderr_done {
+            drain_orphans(child_pid);
             return (exit_code_from_wstatus(wstatus), !stdin_open);
         }
     }
 
     // Final waitpid if we broke out early.
     if !child_exited {
-        // SAFETY: child_pid is valid.
         unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
     }
+    drain_orphans(child_pid);
     (exit_code_from_wstatus(wstatus), !stdin_open)
 }
 
@@ -835,10 +860,12 @@ fn forward_io_tty(conn_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) -> i
         // Grace period handles background jobs holding the slave open.
         if child_exited {
             if master_done {
+                drain_orphans(child_pid);
                 return exit_code_from_wstatus(wstatus);
             }
             if let Some(deadline) = grace_deadline {
                 if std::time::Instant::now() >= deadline {
+                    drain_orphans(child_pid);
                     return exit_code_from_wstatus(wstatus);
                 }
             }
@@ -848,7 +875,12 @@ fn forward_io_tty(conn_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) -> i
     if !child_exited {
         unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
     }
+    drain_orphans(child_pid);
     exit_code_from_wstatus(wstatus)
+}
+
+fn drain_orphans(child_pid: libc::pid_t) {
+    unsafe { while libc::waitpid(-child_pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
 }
 
 /// Drain available data from a non-blocking pipe and write as framed
@@ -867,12 +899,14 @@ fn drain_pipe_to_conn(pipe_fd: RawFd, conn_fd: RawFd, channel: u8) -> bool {
         } else if n == 0 {
             return false; // EOF
         } else {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
-            {
+            let errno = unsafe { *libc::__errno_location() };
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                 return true; // No more data right now
             }
-            return false; // Error
+            if errno == libc::EINTR {
+                continue; // Interrupted by signal, retry
+            }
+            return false; // Real error
         }
     }
 }
@@ -917,24 +951,31 @@ struct FdStream(RawFd);
 
 impl Read for FdStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // SAFETY: self.0 is a valid fd, buf is a valid mutable slice.
-        let n = unsafe { libc::read(self.0, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
+        loop {
+            let n =
+                unsafe { libc::read(self.0, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
         }
     }
 }
 
 impl Write for FdStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // SAFETY: self.0 is a valid fd, buf is a valid slice.
-        let n = unsafe { libc::write(self.0, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
+        loop {
+            let n = unsafe { libc::write(self.0, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
         }
     }
 
