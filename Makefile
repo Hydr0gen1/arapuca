@@ -102,7 +102,7 @@ INSTALL_FEATURES ?=
 install: header
 	touch src/lib.rs
 	mkdir -p target
-	cargo rustc --release --lib \
+	CARGO_TERM_COLOR=never cargo rustc --release --lib \
 	    $(if $(INSTALL_FEATURES),--features $(INSTALL_FEATURES)) \
 	    -- --print native-static-libs 2>&1 \
 	    | grep 'native-static-libs:' \
