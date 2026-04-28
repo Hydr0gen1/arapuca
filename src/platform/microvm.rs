@@ -646,12 +646,16 @@ fn exec_vm_inner(
         }
     }
 
+    // Fix directory permissions that the cloud image ships read-only
+    // (btrfs snapshots). Without this, tools that write to /root or
+    // run RPM scriptlets fail.
+    init_script.push_str(
+        "chmod 755 /root /usr/bin /usr/lib /usr/lib64 /usr/sbin /usr/libexec 2>/dev/null\n",
+    );
+
     // For persistent VMs: mount agent-bin share and start the agent.
     // For ephemeral VMs: exec the user's command directly.
     if persistent.is_some() {
-        init_script.push_str(
-            "chmod 755 /usr/bin /usr/lib /usr/lib64 /usr/sbin /usr/libexec 2>/dev/null\n",
-        );
         init_script.push_str("mkdir -p /agent && mount -t virtiofs -o ro agent-bin /agent\n");
         init_script.push_str("mount -o remount,ro /cidata\n");
         init_script.push_str("/agent/arapuca-agent &\n");
