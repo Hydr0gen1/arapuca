@@ -153,6 +153,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn apply_from_env_honors_explicit_rlimit_as() {
         // SAFETY: test-only env manipulation, no concurrent threads
