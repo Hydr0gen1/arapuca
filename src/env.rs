@@ -220,9 +220,6 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
         let sep = &PATH_LIST_SEP.to_string();
         env.push(("ARAPUCA_WRITE_PATHS".into(), paths.join(sep)));
     }
-    if profile.max_pids > 0 {
-        env.push(("ARAPUCA_RLIMIT_NPROC".into(), profile.max_pids.to_string()));
-    }
     if profile.max_file_size_mb > 0 {
         env.push((
             "ARAPUCA_RLIMIT_FSIZE".into(),
@@ -522,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_env_omits_rlimit_as() {
+    fn wrapper_env_omits_per_uid_rlimits() {
         let profile = crate::Profile {
             max_memory_mb: 256,
             max_pids: 100,
@@ -530,9 +527,14 @@ mod tests {
             ..Default::default()
         };
         let env = wrapper_env(&profile);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert!(
-            !env.iter().any(|(k, _)| k == "ARAPUCA_RLIMIT_AS"),
+            !keys.contains(&"ARAPUCA_RLIMIT_AS"),
             "wrapper_env must not emit ARAPUCA_RLIMIT_AS"
+        );
+        assert!(
+            !keys.contains(&"ARAPUCA_RLIMIT_NPROC"),
+            "wrapper_env must not emit ARAPUCA_RLIMIT_NPROC"
         );
     }
 
@@ -549,9 +551,9 @@ mod tests {
         let map: std::collections::HashMap<&str, &str> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        assert_eq!(map.get("ARAPUCA_RLIMIT_NPROC"), Some(&"100"));
         let fsize_bytes = (512u64 * 1024 * 1024).to_string();
         assert_eq!(map.get("ARAPUCA_RLIMIT_FSIZE"), Some(&fsize_bytes.as_str()));
         assert_eq!(map.get("ARAPUCA_READ_PATHS"), Some(&"/usr"));
+        assert!(!map.contains_key("ARAPUCA_RLIMIT_NPROC"));
     }
 }

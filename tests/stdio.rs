@@ -183,10 +183,7 @@ fn stdin_stdout_relay_cat_with_wrapper() {
     let status = proc.wait().unwrap();
     proc.cleanup();
 
-    assert!(
-        status.success(),
-        "cat should exit 0, stderr: {stderr}"
-    );
+    assert!(status.success(), "cat should exit 0, stderr: {stderr}");
     assert_eq!(
         stdout.trim(),
         "relay-test",

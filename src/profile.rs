@@ -79,7 +79,8 @@ pub struct Profile {
     pub max_memory_mb: u64,
     /// CPU percentage limit (0 = no limit; 200 = 2 cores).
     pub max_cpu_pct: u32,
-    /// Maximum number of processes (0 = no limit).
+    /// Maximum number of processes (0 = no limit). Enforced via
+    /// cgroups v2 `pids.max` on Linux.
     pub max_pids: u32,
     /// Maximum file size in MB via RLIMIT_FSIZE (0 = no limit).
     pub max_file_size_mb: u64,

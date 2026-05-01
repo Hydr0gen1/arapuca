@@ -10,7 +10,8 @@
 //!   ARAPUCA_RLIMIT_AS:    max virtual memory in bytes (opt-in only,
 //!                         not set automatically — use for C programs
 //!                         that must not allocate large virtual ranges)
-//!   ARAPUCA_RLIMIT_NPROC: max processes (0 = no limit)
+//!   ARAPUCA_RLIMIT_NPROC: max processes (opt-in only, not set
+//!                         automatically — per-UID system-wide limit)
 //!   ARAPUCA_RLIMIT_CPU:   max CPU seconds (0 = no limit)
 //!   ARAPUCA_RLIMIT_FSIZE: max file size in bytes (0 = no limit)
 //!

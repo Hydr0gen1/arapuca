@@ -455,10 +455,12 @@ impl Sandbox for Linux {
                 }
             }
         } else if limits.has_limits() {
-            if cfg.profile.max_memory_mb > 0 {
+            if cfg.profile.max_memory_mb > 0 || cfg.profile.max_pids > 0 {
                 log::warn!(
-                    "memory limit {}MB requested but cgroups unavailable — no memory enforcement",
-                    cfg.profile.max_memory_mb
+                    "resource limits requested (memory={}MB, pids={}) but cgroups \
+                     unavailable — no enforcement",
+                    cfg.profile.max_memory_mb,
+                    cfg.profile.max_pids
                 );
             }
             if let Some(ref ctx) = audit_ctx {

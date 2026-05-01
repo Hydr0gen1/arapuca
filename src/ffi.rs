@@ -177,7 +177,9 @@ pub unsafe extern "C" fn arapuca_profile_set_cpu_pct(profile: *mut ArapucaProfil
     }
 }
 
-/// Set maximum PIDs.
+/// Set maximum PIDs. Enforced via cgroups v2 `pids.max` on Linux
+/// (through the launch path). Does NOT set RLIMIT_NPROC, which is
+/// a per-UID system-wide limit that breaks sandboxed workloads.
 ///
 /// # Safety
 /// `profile` must be a valid pointer.
