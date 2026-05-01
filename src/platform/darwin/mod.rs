@@ -252,15 +252,7 @@ impl Sandbox for Darwin {
 
         // Add rlimit env vars for the wrapper (if using it).
         if wrapper.is_some() {
-            let mut rlimit_profile = cfg.profile.clone();
-
-            // Skip RLIMIT_AS on Apple Silicon — macOS aggressively maps
-            // virtual memory and setting it causes immediate SIGKILL.
-            if std::env::consts::ARCH == "aarch64" {
-                rlimit_profile.max_memory_mb = 0;
-            }
-
-            let wrapper_env = crate::env::wrapper_env(&rlimit_profile);
+            let wrapper_env = crate::env::wrapper_env(&cfg.profile);
             env_vars.extend(wrapper_env);
 
             // Add RLIMIT_CPU if cpu_pct is set (convert % to seconds).

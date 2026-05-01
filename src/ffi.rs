@@ -149,7 +149,9 @@ pub unsafe extern "C" fn arapuca_profile_add_write_path(
     0
 }
 
-/// Set memory limit in MB.
+/// Set memory limit in MB. Enforced via cgroups v2 `memory.max`
+/// on Linux (through the launch path) and RSS polling on macOS.
+/// Does NOT set RLIMIT_AS, which would break Go/JVM/.NET runtimes.
 ///
 /// # Safety
 /// `profile` must be a valid pointer.

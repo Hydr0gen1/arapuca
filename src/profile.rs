@@ -73,7 +73,9 @@ pub struct Profile {
     pub read_paths: Vec<PathBuf>,
     /// Allowed read-write paths (canonicalized).
     pub write_paths: Vec<PathBuf>,
-    /// Memory limit in MB (0 = no limit). u64 to support >4GB.
+    /// Memory limit in MB (0 = no limit). Enforced via cgroups v2
+    /// `memory.max` on Linux and RSS polling on macOS. u64 to
+    /// support >4GB.
     pub max_memory_mb: u64,
     /// CPU percentage limit (0 = no limit; 200 = 2 cores).
     pub max_cpu_pct: u32,

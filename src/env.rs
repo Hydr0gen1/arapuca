@@ -220,12 +220,6 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
         let sep = &PATH_LIST_SEP.to_string();
         env.push(("ARAPUCA_WRITE_PATHS".into(), paths.join(sep)));
     }
-    if profile.max_memory_mb > 0 {
-        env.push((
-            "ARAPUCA_RLIMIT_AS".into(),
-            (profile.max_memory_mb * 1024 * 1024).to_string(),
-        ));
-    }
     if profile.max_pids > 0 {
         env.push(("ARAPUCA_RLIMIT_NPROC".into(), profile.max_pids.to_string()));
     }
@@ -525,5 +519,39 @@ mod tests {
     fn bridge_env_colon_in_path() {
         let result = bridge_env(true, Some(Path::new("/tmp/bad:path.sock")));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wrapper_env_omits_rlimit_as() {
+        let profile = crate::Profile {
+            max_memory_mb: 256,
+            max_pids: 100,
+            max_file_size_mb: 512,
+            ..Default::default()
+        };
+        let env = wrapper_env(&profile);
+        assert!(
+            !env.iter().any(|(k, _)| k == "ARAPUCA_RLIMIT_AS"),
+            "wrapper_env must not emit ARAPUCA_RLIMIT_AS"
+        );
+    }
+
+    #[test]
+    fn wrapper_env_emits_remaining_rlimits() {
+        let profile = crate::Profile {
+            max_memory_mb: 256,
+            max_pids: 100,
+            max_file_size_mb: 512,
+            read_paths: vec![PathBuf::from("/usr")],
+            ..Default::default()
+        };
+        let env = wrapper_env(&profile);
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        assert_eq!(map.get("ARAPUCA_RLIMIT_NPROC"), Some(&"100"));
+        let fsize_bytes = (512u64 * 1024 * 1024).to_string();
+        assert_eq!(map.get("ARAPUCA_RLIMIT_FSIZE"), Some(&fsize_bytes.as_str()));
+        assert_eq!(map.get("ARAPUCA_READ_PATHS"), Some(&"/usr"));
     }
 }

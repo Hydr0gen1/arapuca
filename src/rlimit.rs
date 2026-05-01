@@ -1,14 +1,24 @@
 //! POSIX resource limits (rlimits).
 //!
 //! Sets hard resource limits on the sandboxed process:
-//! - RLIMIT_AS: virtual memory size
 //! - RLIMIT_NPROC: number of processes
 //! - RLIMIT_CPU: CPU time in seconds
 //! - RLIMIT_FSIZE: maximum file size
+//!
+//! Memory is enforced via cgroups v2 `memory.max` (Linux) or RSS
+//! polling (macOS), not RLIMIT_AS. RLIMIT_AS limits virtual address
+//! space, which breaks runtimes (Go, JVM, .NET) that reserve large
+//! PROT_NONE mappings at startup. Explicit opt-in via the
+//! `ARAPUCA_RLIMIT_AS` env var is still available in `apply_from_env()`.
 
 use crate::{Error, Profile};
 
 /// Apply resource limits from the profile to the current process.
+///
+/// Sets RLIMIT_NPROC and RLIMIT_FSIZE. Memory is intentionally NOT
+/// limited via RLIMIT_AS here — use cgroups v2 `memory.max` instead.
+/// RLIMIT_AS restricts virtual address space, which breaks Go, JVM,
+/// and .NET runtimes that reserve large PROT_NONE mappings at startup.
 ///
 /// Each limit is set as both soft and hard (identical values), meaning
 /// the process cannot raise them. Limits of 0 mean "no limit" and are
@@ -19,10 +29,6 @@ use crate::{Error, Profile};
 /// Returns an error if any `prlimit64` call fails.
 #[must_use = "rlimit errors must be handled"]
 pub fn apply(profile: &Profile) -> crate::Result<()> {
-    if profile.max_memory_mb > 0 {
-        let bytes = profile.max_memory_mb * 1024 * 1024;
-        set_rlimit(libc::RLIMIT_AS, bytes, "RLIMIT_AS")?;
-    }
     if profile.max_pids > 0 {
         set_rlimit(
             libc::RLIMIT_NPROC,
@@ -119,5 +125,41 @@ mod tests {
     #[test]
     fn parse_env_missing() {
         assert!(parse_env_u64("ARAPUCA_TEST_NONEXISTENT").unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_does_not_set_rlimit_as() {
+        let before = {
+            let mut rlim: libc::rlimit64 = unsafe { std::mem::zeroed() };
+            // SAFETY: prlimit64 with pid=0 reads the current process limit.
+            unsafe { libc::prlimit64(0, libc::RLIMIT_AS, std::ptr::null(), &mut rlim) };
+            rlim.rlim_cur
+        };
+
+        let profile = Profile {
+            max_memory_mb: 256,
+            ..Default::default()
+        };
+        apply(&profile).unwrap();
+
+        let after = {
+            let mut rlim: libc::rlimit64 = unsafe { std::mem::zeroed() };
+            // SAFETY: prlimit64 with pid=0 reads the current process limit.
+            unsafe { libc::prlimit64(0, libc::RLIMIT_AS, std::ptr::null(), &mut rlim) };
+            rlim.rlim_cur
+        };
+
+        assert_eq!(before, after, "apply() must not modify RLIMIT_AS");
+    }
+
+    #[test]
+    fn apply_from_env_honors_explicit_rlimit_as() {
+        // SAFETY: test-only env manipulation, no concurrent threads
+        // reading this variable.
+        unsafe { std::env::set_var("ARAPUCA_RLIMIT_AS", "17179869184") };
+        let result = apply_from_env();
+        unsafe { std::env::remove_var("ARAPUCA_RLIMIT_AS") };
+        assert!(result.is_ok(), "explicit ARAPUCA_RLIMIT_AS must be honored");
     }
 }
