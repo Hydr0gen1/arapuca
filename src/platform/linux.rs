@@ -413,6 +413,8 @@ impl Sandbox for Linux {
                 tier2_eperm_count: seccomp.tier2_eperm_count,
                 socket_filter: seccomp.socket_filter,
                 prctl_filter: seccomp.prctl_filter,
+                clone_ns_filter: seccomp.clone_ns_filter,
+                clone3_enosys: seccomp.clone3_enosys,
                 allow_exec: cfg.profile.allow_exec,
             })?;
         }

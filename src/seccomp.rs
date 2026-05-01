@@ -4,11 +4,13 @@
 //! install BPF filters that restrict which syscalls a sandboxed process
 //! can make.
 //!
-//! Two tiers of response:
+//! Three tiers of response:
 //! - **Tier 1 (KILL_PROCESS)**: Syscalls with no legitimate agent use
 //!   (ptrace, mount, namespace manipulation, kernel modules, etc.).
 //! - **Tier 2 (EPERM)**: Syscalls that may be probed by libraries
-//!   (symlink, link, network sockets, perf_event_open, etc.).
+//!   (symlink, link, network sockets, clone with namespace flags, etc.).
+//! - **Tier 3 (ENOSYS)**: `clone3` — forces runtime fallback to `clone`
+//!   where namespace flags can be inspected via arg0.
 
 use std::collections::HashMap;
 
@@ -162,11 +164,63 @@ fn build_filter() -> crate::Result<BpfProgram> {
 
     eperm_rules.insert(libc::SYS_execveat, vec![execveat_empty_path]);
 
+    // Block clone(2) with any CLONE_NEW* namespace flag. One rule per
+    // flag — seccompiler OR's multiple rules for the same syscall.
+    // Uses Qword (64-bit) to match the unsigned long flags argument.
+    let clone_ns_flags: &[(i64, &str)] = &[
+        (0x0002_0000, "CLONE_NEWNS"),
+        (0x0200_0000, "CLONE_NEWCGROUP"),
+        (0x0400_0000, "CLONE_NEWUTS"),
+        (0x0800_0000, "CLONE_NEWIPC"),
+        (0x1000_0000, "CLONE_NEWUSER"),
+        (0x2000_0000, "CLONE_NEWPID"),
+        (0x4000_0000, "CLONE_NEWNET"),
+        (0x0000_0080, "CLONE_NEWTIME"),
+    ];
+
+    let mut clone_rules = Vec::new();
+    for &(flag, name) in clone_ns_flags {
+        let rule = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(flag as u64),
+                flag as u64,
+            )
+            .map_err(|e| Error::Seccomp(format!("clone {name} condition: {e}")))?,
+        ])
+        .map_err(|e| Error::Seccomp(format!("clone {name} rule: {e}")))?;
+        clone_rules.push(rule);
+    }
+    eperm_rules.insert(libc::SYS_clone, clone_rules);
+
     // NOTE: we do NOT block seccomp(SET_MODE_FILTER) because seccomp
     // filters stack — new filters can only be more restrictive (kernel
     // takes the most restrictive action across all filters). Blocking it
-    // would also prevent our own two-phase filter installation since the
-    // EPERM filter is installed before the KILL filter.
+    // would also prevent our three-phase filter installation.
+
+    // --- ENOSYS filter for clone3 ---
+    // Return ENOSYS so Go/glibc fall back to clone(2), where we CAN
+    // inspect flags via arg0. This is the Chromium/Firefox approach.
+    // We cannot filter clone3 flags because they're inside a struct
+    // behind a pointer, not a direct syscall argument.
+    let mut enosys_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    enosys_rules.insert(libc::SYS_clone3, vec![]);
+
+    let enosys_filter = SeccompFilter::new(
+        enosys_rules.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build enosys filter: {e}")))?;
+
+    let enosys_prog: BpfProgram =
+        enosys_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile enosys filter: {e}"))
+            })?;
 
     let eperm_filter = SeccompFilter::new(
         eperm_rules.into_iter().collect(),
@@ -183,12 +237,13 @@ fn build_filter() -> crate::Result<BpfProgram> {
                 Error::Seccomp(format!("compile eperm filter: {e}"))
             })?;
 
-    // Install EPERM filter first. Seccomp filter stacking: last
-    // installed is checked first. Since KILL is more restrictive than
-    // EPERM, and the kernel takes the most restrictive action across
-    // all filters, the ordering doesn't actually matter for
-    // correctness. But we install EPERM first so the KILL filter's
-    // PR_SET_NO_NEW_PRIVS call covers both.
+    // Install order: ENOSYS → EPERM → KILL (last installed checked
+    // first by kernel). The kernel takes the most restrictive action
+    // across all filters: KILL > ERRNO > ALLOW. The ENOSYS and EPERM
+    // filters target different syscalls (no overlap), so the equal
+    // precedence of ERRNO values is not a concern.
+    seccompiler::apply_filter(&enosys_prog)
+        .map_err(|e| Error::Seccomp(format!("install enosys filter: {e}")))?;
     seccompiler::apply_filter(&eperm_prog)
         .map_err(|e| Error::Seccomp(format!("install eperm filter: {e}")))?;
 
@@ -218,7 +273,6 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_process_vm_writev,
         libc::SYS_userfaultfd,
         libc::SYS_kcmp,
-        libc::SYS_clone3,
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
@@ -255,16 +309,20 @@ pub(crate) struct SeccompSummary {
     pub tier2_eperm_count: usize,
     pub socket_filter: bool,
     pub prctl_filter: bool,
+    pub clone_ns_filter: bool,
+    pub clone3_enosys: bool,
 }
 
-// NOTE: socket_filter and prctl_filter are hardcoded to match
-// build_filter(). Update these if those filters become conditional.
+// NOTE: filter flags are hardcoded to match build_filter(). Update
+// these if those filters become conditional.
 pub(crate) fn summary() -> SeccompSummary {
     SeccompSummary {
         tier1_kill_count: tier1_kill_syscalls().len(),
         tier2_eperm_count: tier2_eperm_syscalls().len(),
         socket_filter: true,
         prctl_filter: true,
+        clone_ns_filter: true,
+        clone3_enosys: true,
     }
 }
 
@@ -421,5 +479,164 @@ mod tests {
         });
         assert!(exited, "child should exit normally");
         assert_eq!(code, 42, "AF_UNIX socket should be allowed");
+    }
+
+    #[test]
+    fn tier1_unshare_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: unshare with 0 flags is harmless but triggers the filter.
+            unsafe { libc::unshare(0) };
+        });
+        assert!(!exited, "unshare should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn tier1_setns_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: setns with invalid fd is harmless but triggers the filter.
+            unsafe { libc::syscall(libc::SYS_setns, -1i32, 0i32) };
+        });
+        assert!(!exited, "setns should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn clone3_returns_enosys() {
+        let (exited, code) = run_in_filtered_child(|| {
+            // SAFETY: clone3 with NULL args returns EFAULT normally,
+            // but our filter intercepts before the kernel checks args.
+            let ret = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::ENOSYS {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "clone3 should return ENOSYS, not kill");
+        assert_eq!(code, 42, "expected ENOSYS (exit 42)");
+    }
+
+    #[test]
+    fn clone_thread_still_allowed() {
+        let (exited, code) = run_in_filtered_child(|| {
+            const STACK_SIZE: usize = 64 * 1024;
+            let stack = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    STACK_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+                    -1,
+                    0,
+                )
+            };
+            if stack == libc::MAP_FAILED {
+                unsafe { libc::_exit(2) };
+            }
+            let stack_top = unsafe { (stack as *mut u8).add(STACK_SIZE) };
+
+            // CLONE_THREAD requires CLONE_SIGHAND which requires CLONE_VM.
+            const FLAGS: libc::c_ulong = (libc::CLONE_THREAD
+                | libc::CLONE_SIGHAND
+                | libc::CLONE_VM
+                | libc::CLONE_FS
+                | libc::CLONE_FILES) as libc::c_ulong;
+
+            // SAFETY: valid stack, thread immediately exits.
+            extern "C" fn thread_fn(_arg: *mut libc::c_void) -> libc::c_int {
+                0
+            }
+
+            let ret = unsafe {
+                libc::clone(
+                    thread_fn,
+                    stack_top.cast(),
+                    FLAGS as i32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ret > 0 {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "clone(CLONE_THREAD) should not be killed");
+        assert_eq!(code, 42, "thread creation should succeed");
+    }
+
+    #[test]
+    fn clone_newuser_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            // SAFETY: clone with CLONE_NEWUSER and SIGCHLD, NULL stack
+            // (kernel allocates). Will fail anyway but we just check the errno.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_NEWUSER | libc::SIGCHLD,
+                    std::ptr::null::<u8>(),
+                    std::ptr::null::<u8>(),
+                    std::ptr::null::<u8>(),
+                    0usize,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::EPERM {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "clone(CLONE_NEWUSER) should return EPERM, not kill");
+        assert_eq!(code, 42, "expected EPERM (exit 42)");
+    }
+
+    #[test]
+    fn clone_newnet_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_NEWNET | libc::SIGCHLD,
+                    std::ptr::null::<u8>(),
+                    std::ptr::null::<u8>(),
+                    std::ptr::null::<u8>(),
+                    0usize,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::EPERM {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "clone(CLONE_NEWNET) should return EPERM, not kill");
+        assert_eq!(code, 42, "expected EPERM (exit 42)");
+    }
+
+    #[test]
+    fn clone_combined_ns_thread_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            // Namespace flag takes precedence even combined with CLONE_THREAD.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_THREAD | libc::CLONE_NEWUSER | libc::SIGCHLD,
+                    std::ptr::null::<u8>(),
+                    std::ptr::null::<u8>(),
+                    std::ptr::null::<u8>(),
+                    0usize,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::EPERM {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(
+            exited,
+            "clone(CLONE_THREAD|CLONE_NEWUSER) should return EPERM"
+        );
+        assert_eq!(code, 42, "namespace flag should override thread flag");
     }
 }
