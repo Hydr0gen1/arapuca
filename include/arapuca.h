@@ -146,7 +146,9 @@ int32_t arapuca_profile_add_read_path(struct arapuca_ArapucaProfile *profile, co
 int32_t arapuca_profile_add_write_path(struct arapuca_ArapucaProfile *profile, const char *path);
 
 /**
- * Set memory limit in MB.
+ * Set memory limit in MB. Enforced via cgroups v2 `memory.max`
+ * on Linux (through the launch path) and RSS polling on macOS.
+ * Does NOT set RLIMIT_AS, which would break Go/JVM/.NET runtimes.
  *
  * # Safety
  * `profile` must be a valid pointer.
@@ -162,7 +164,9 @@ void arapuca_profile_set_memory_mb(struct arapuca_ArapucaProfile *profile, uint6
 void arapuca_profile_set_cpu_pct(struct arapuca_ArapucaProfile *profile, uint32_t pct);
 
 /**
- * Set maximum PIDs.
+ * Set maximum PIDs. Enforced via cgroups v2 `pids.max` on Linux
+ * (through the launch path). Does NOT set RLIMIT_NPROC, which is
+ * a per-UID system-wide limit that breaks sandboxed workloads.
  *
  * # Safety
  * `profile` must be a valid pointer.
