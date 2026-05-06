@@ -50,13 +50,17 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-seccompiler = "0.5"
 krun-sys = { version = "1.10", optional = true }
-
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
 openssl = { version = "0.10", optional = true }
 gpt = { version = "4.1", optional = true }
 nbd = { version = "0.3", optional = true }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+seccompiler = "0.5"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(seccomp_supported)'] }
 
 [dev-dependencies]
 env_logger = "0.11"
