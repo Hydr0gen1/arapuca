@@ -35,8 +35,7 @@ fn sandboxed_command(
         .expect("failed to run arapuca")
 }
 
-/// Run a command through the arapuca sandbox with no filesystem restrictions
-/// (seccomp only).
+#[cfg(seccomp_supported)]
 fn seccomp_only_command(cmd: &str, args: &[&str]) -> std::process::Output {
     Command::new(arapuca_bin())
         .args(["--", cmd])
@@ -92,6 +91,7 @@ fn landlock_blocks_write_to_read_path() {
     );
 }
 
+#[cfg(seccomp_supported)]
 #[test]
 fn seccomp_blocks_network_ipv4() {
     // Attempt to create an IPv4 socket — should return EPERM.
@@ -117,6 +117,7 @@ fn seccomp_blocks_network_ipv4() {
     );
 }
 
+#[cfg(seccomp_supported)]
 #[test]
 fn seccomp_allows_unix_socket() {
     // AF_UNIX sockets should be allowed (needed for JSON-RPC).
@@ -134,6 +135,7 @@ fn seccomp_allows_unix_socket() {
     );
 }
 
+#[cfg(seccomp_supported)]
 #[test]
 fn seccomp_blocks_symlink() {
     // symlink should return EPERM.
@@ -151,6 +153,7 @@ fn seccomp_blocks_symlink() {
     );
 }
 
+#[cfg(seccomp_supported)]
 #[test]
 fn seccomp_blocks_ptrace() {
     // ptrace should kill the process.

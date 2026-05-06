@@ -912,16 +912,17 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
     };
 
     #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = crate::landlock::apply(inner) {
-            set_error(&format!("landlock: {e}"));
-            return -1;
-        }
-        if let Err(e) = crate::seccomp::apply() {
-            set_error(&format!("seccomp: {e}"));
-            return -1;
-        }
+    if let Err(e) = crate::landlock::apply(inner) {
+        set_error(&format!("landlock: {e}"));
+        return -1;
     }
+    #[cfg(seccomp_supported)]
+    if let Err(e) = crate::seccomp::apply() {
+        set_error(&format!("seccomp: {e}"));
+        return -1;
+    }
+    #[cfg(all(target_os = "linux", not(seccomp_supported)))]
+    log::warn!("seccomp not available on this architecture");
     #[cfg(unix)]
     if let Err(e) = crate::rlimit::apply(inner) {
         set_error(&format!("rlimit: {e}"));

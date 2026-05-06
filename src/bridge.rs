@@ -157,7 +157,7 @@ pub fn loopback_up() -> io::Result<()> {
 const MAX_CONNECTIONS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Thread-creation flags required by glibc/musl for `pthread_create`.
+#[cfg(seccomp_supported)]
 const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_FS
     | libc::CLONE_FILES
@@ -187,6 +187,7 @@ const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
 /// # Errors
 ///
 /// Returns an error if the filter cannot be built or installed.
+#[cfg(seccomp_supported)]
 pub fn apply_bridge_seccomp() -> crate::Result<()> {
     let (clone3_prog, main_prog) = build_bridge_filters()?;
 
@@ -203,9 +204,7 @@ pub fn apply_bridge_seccomp() -> crate::Result<()> {
     Ok(())
 }
 
-/// Build two BPF programs:
-/// 1. clone3 → ENOSYS (forces glibc fallback to clone)
-/// 2. main allowlist (everything else)
+#[cfg(seccomp_supported)]
 fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
@@ -503,6 +502,7 @@ pub fn listen_and_relay(listener: TcpListener, uds_path: &Path, ready_fd: RawFd)
 mod tests {
     use super::*;
 
+    #[cfg(seccomp_supported)]
     #[test]
     fn bridge_seccomp_filters_build() {
         let (clone3_prog, main_prog) = build_bridge_filters().unwrap();

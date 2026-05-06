@@ -111,7 +111,6 @@ impl Sandbox for Linux {
             let abi = crate::landlock::abi_version();
             for layer in [
                 SandboxLayer::Landlock,
-                SandboxLayer::Seccomp,
                 SandboxLayer::Rlimit,
                 SandboxLayer::NoNewPrivs,
             ] {
@@ -132,6 +131,29 @@ impl Sandbox for Linux {
                 }
                 applied_layers.push(layer);
             }
+            #[cfg(seccomp_supported)]
+            {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerApplied {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::Seccomp,
+                        detail: None,
+                    })?;
+                }
+                applied_layers.push(SandboxLayer::Seccomp);
+            }
+            #[cfg(not(seccomp_supported))]
+            {
+                log::warn!("seccomp not available on this architecture");
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::Seccomp,
+                        reason: SkipReason::PlatformUnsupported,
+                    })?;
+                }
+                skipped_layers.push(SandboxLayer::Seccomp);
+            }
         } else {
             // Wrapper binary absent or no paths configured — no
             // Landlock/seccomp/rlimit/NO_NEW_PRIVS.
@@ -145,7 +167,6 @@ impl Sandbox for Linux {
             };
             for layer in [
                 SandboxLayer::Landlock,
-                SandboxLayer::Seccomp,
                 SandboxLayer::Rlimit,
                 SandboxLayer::NoNewPrivs,
             ] {
@@ -157,6 +178,28 @@ impl Sandbox for Linux {
                     })?;
                 }
                 skipped_layers.push(layer);
+            }
+            #[cfg(seccomp_supported)]
+            {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::Seccomp,
+                        reason: reason.clone(),
+                    })?;
+                }
+                skipped_layers.push(SandboxLayer::Seccomp);
+            }
+            #[cfg(not(seccomp_supported))]
+            {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::Seccomp,
+                        reason: SkipReason::PlatformUnsupported,
+                    })?;
+                }
+                skipped_layers.push(SandboxLayer::Seccomp);
             }
         }
 
@@ -406,17 +449,20 @@ impl Sandbox for Linux {
                     .map(|p| sanitize_audit_string(&p.to_string_lossy())),
             })?;
 
-            let seccomp = crate::seccomp::summary();
-            ctx.emit(AuditEvent::SeccompPolicy {
-                timestamp: ctx.timestamp(),
-                tier1_kill_count: seccomp.tier1_kill_count,
-                tier2_eperm_count: seccomp.tier2_eperm_count,
-                socket_filter: seccomp.socket_filter,
-                prctl_filter: seccomp.prctl_filter,
-                clone_ns_filter: seccomp.clone_ns_filter,
-                clone3_enosys: seccomp.clone3_enosys,
-                allow_exec: cfg.profile.allow_exec,
-            })?;
+            #[cfg(seccomp_supported)]
+            {
+                let seccomp = crate::seccomp::summary();
+                ctx.emit(AuditEvent::SeccompPolicy {
+                    timestamp: ctx.timestamp(),
+                    tier1_kill_count: seccomp.tier1_kill_count,
+                    tier2_eperm_count: seccomp.tier2_eperm_count,
+                    socket_filter: seccomp.socket_filter,
+                    prctl_filter: seccomp.prctl_filter,
+                    clone_ns_filter: seccomp.clone_ns_filter,
+                    clone3_enosys: seccomp.clone3_enosys,
+                    allow_exec: cfg.profile.allow_exec,
+                })?;
+            }
         }
 
         // ── Create cgroup ──────────────────────────────────────────

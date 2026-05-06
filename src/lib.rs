@@ -29,7 +29,7 @@ mod process;
 mod profile;
 #[cfg(unix)]
 pub mod rlimit;
-#[cfg(target_os = "linux")]
+#[cfg(seccomp_supported)]
 pub mod seccomp;
 mod validate;
 #[cfg(target_os = "linux")]

@@ -106,12 +106,25 @@ fn main() {
             }
         }
 
-        if let Err(e) = arapuca::seccomp::apply() {
-            audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
-            eprintln!("arapuca: seccomp: {e}");
-            std::process::exit(1);
+        #[cfg(seccomp_supported)]
+        {
+            if let Err(e) = arapuca::seccomp::apply() {
+                audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
+                eprintln!("arapuca: seccomp: {e}");
+                std::process::exit(1);
+            }
+            audit_layer(audit_fd, "Seccomp", true, None);
         }
-        audit_layer(audit_fd, "Seccomp", true, None);
+        #[cfg(not(seccomp_supported))]
+        {
+            log::warn!("seccomp not available on this architecture — skipping");
+            audit_layer(
+                audit_fd,
+                "Seccomp",
+                false,
+                Some("not supported on this architecture"),
+            );
+        }
     }
 
     // 3. Resource limits from env vars (Unix only).
@@ -1587,14 +1600,14 @@ fn fork_bridge(audit_fd: Option<i32>) -> Option<u16> {
 
     let uds_path = PathBuf::from(uds_path);
 
-    // Invariant: seccomp must not be applied yet. The bridge child
-    // needs to create sockets and bind before its own seccomp is
-    // installed.
-    // SAFETY: PR_GET_SECCOMP is a simple query, no pointer args.
-    let seccomp_mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-    if seccomp_mode != 0 {
-        eprintln!("arapuca: bridge: seccomp already applied (invariant violation)");
-        std::process::exit(1);
+    #[cfg(seccomp_supported)]
+    {
+        // SAFETY: PR_GET_SECCOMP is a simple query, no pointer args.
+        let seccomp_mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
+        if seccomp_mode != 0 {
+            eprintln!("arapuca: bridge: seccomp already applied (invariant violation)");
+            std::process::exit(1);
+        }
     }
 
     // Bring up loopback inside the network namespace.
@@ -1677,12 +1690,13 @@ fn fork_bridge(audit_fd: Option<i32>) -> Option<u16> {
         // Prevents /proc/<pid>/mem access from the agent.
         unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
 
-        // Apply the bridge's own seccomp filter. The listener is
-        // already bound, so bind/listen are not needed.
+        #[cfg(seccomp_supported)]
         if let Err(e) = arapuca::bridge::apply_bridge_seccomp() {
             eprintln!("arapuca: bridge: seccomp: {e}");
             unsafe { libc::_exit(1) };
         }
+        #[cfg(not(seccomp_supported))]
+        log::warn!("bridge: seccomp not available — running without syscall filter");
 
         // Enter the accept/relay loop. This never returns normally
         // — the bridge runs until killed by pdeathsig.
