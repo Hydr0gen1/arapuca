@@ -226,12 +226,15 @@ fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler
         libc::SYS_sendto,
         libc::SYS_close,
         libc::SYS_shutdown,
-        libc::SYS_poll,
         libc::SYS_ppoll,
-        libc::SYS_epoll_wait,
+        libc::SYS_epoll_pwait,
         libc::SYS_epoll_ctl,
         libc::SYS_epoll_create1,
     ] {
+        allow.insert(nr, vec![]);
+    }
+    #[cfg(target_arch = "x86_64")]
+    for nr in [libc::SYS_poll, libc::SYS_epoll_wait] {
         allow.insert(nr, vec![]);
     }
 

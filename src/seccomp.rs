@@ -294,13 +294,18 @@ fn tier1_kill_syscalls() -> Vec<i64> {
 /// May be probed by libraries; returning EPERM is less disruptive
 /// than killing the process.
 fn tier2_eperm_syscalls() -> Vec<i64> {
-    vec![
-        libc::SYS_symlink,
+    #[allow(unused_mut)]
+    let mut v = vec![
         libc::SYS_symlinkat,
-        libc::SYS_link,
         libc::SYS_linkat,
         libc::SYS_perf_event_open,
-    ]
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        v.push(libc::SYS_symlink);
+        v.push(libc::SYS_link);
+    }
+    v
 }
 
 /// Summary of the seccomp filter policy for audit reporting.
