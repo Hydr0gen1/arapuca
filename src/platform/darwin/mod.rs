@@ -167,7 +167,10 @@ impl Sandbox for Darwin {
             .collect();
 
         // Add socket dir to read paths so the agent can connect.
-        read_paths.push(cfg.socket_dir.to_string_lossy().into_owned());
+        let has_socket_dir = !cfg.socket_dir.as_os_str().is_empty();
+        if has_socket_dir {
+            read_paths.push(cfg.socket_dir.to_string_lossy().into_owned());
+        }
 
         // Add tmp_dir to write paths.
         write_paths.push(tmp_dir.to_string_lossy().into_owned());
@@ -179,14 +182,25 @@ impl Sandbox for Darwin {
             }
         }
 
-        let exec_paths: Vec<String> = Vec::new();
+        let mut exec_paths: Vec<String> = Vec::new();
+        let cmd_path = std::path::Path::new(cmd);
+        if let Some(parent) = cmd_path.parent() {
+            let parent_str = parent.to_string_lossy().into_owned();
+            if !parent_str.is_empty() {
+                exec_paths.push(parent_str);
+            }
+        }
 
-        let control_socket = Some(
-            cfg.socket_dir
-                .join("control.sock")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let control_socket = if has_socket_dir {
+            Some(
+                cfg.socket_dir
+                    .join("control.sock")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
         let llm_socket = cfg
             .network_proxy_socket
             .as_ref()
