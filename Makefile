@@ -45,9 +45,16 @@ test:
 test-unit:
 	cargo test --lib
 
-# Integration tests (Linux only — exercises Landlock, seccomp, cgroups).
+# Integration tests (platform-specific).
+# Linux: exercises Landlock, seccomp, cgroups.
+# macOS: exercises Seatbelt sandbox-exec.
 test-integration:
+ifeq ($(shell uname -s),Linux)
 	cargo test --test adversarial
+endif
+ifeq ($(shell uname -s),Darwin)
+	cargo test --test darwin
+endif
 
 lint: fmt-check clippy
 
@@ -73,6 +80,9 @@ check: fmt-check clippy test-unit
 ci: check
 ifeq ($(shell uname -s),Linux)
 	cargo test --test adversarial
+endif
+ifeq ($(shell uname -s),Darwin)
+	cargo test --test darwin
 endif
 
 ci-full: fmt-check clippy test
