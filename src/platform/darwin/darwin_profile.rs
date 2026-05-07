@@ -32,13 +32,13 @@ pub struct ProfileData {
 /// This prevents injection attacks where a crafted path could break out
 /// of the `(subpath ...)` or `(literal ...)` expressions in the profile.
 ///
-/// Allowed characters: `[a-zA-Z0-9/_. -]`
+/// Allowed characters: `[a-zA-Z0-9/_. @-]`
 pub fn validate_profile_path(path: &str) -> crate::Result<()> {
     if path.is_empty() {
         return Err(Error::Validation("empty path".into()));
     }
     for ch in path.chars() {
-        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | ' ' | '-') {
+        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | ' ' | '-' | '@') {
             return Err(Error::Validation(format!(
                 "invalid character in sandbox profile path: {:?}",
                 ch
@@ -222,6 +222,8 @@ mod tests {
         assert!(validate_profile_path("/Users/test user/dir").is_ok());
         // Underscore and dash.
         assert!(validate_profile_path("/tmp/my_dir-name").is_ok());
+        // @ in Homebrew versioned paths.
+        assert!(validate_profile_path("/opt/homebrew/opt/python@3.14/bin/python3.14").is_ok());
         // Dots.
         assert!(validate_profile_path("/usr/lib/libfoo.1.2.dylib").is_ok());
     }
