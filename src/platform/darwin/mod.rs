@@ -151,25 +151,34 @@ impl Sandbox for Darwin {
 
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
-        // Build profile data from config.
-        let mut read_paths: Vec<String> = cfg
-            .profile
-            .read_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        // Canonicalize tmp_dir for Seatbelt profile paths. On macOS,
+        // /var -> /private/var and /tmp -> /private/tmp. Seatbelt
+        // resolves symlinks in access paths but stores profile paths
+        // as-is, so un-canonicalized paths cause silent denials.
+        let tmp_dir = std::fs::canonicalize(&tmp_dir).unwrap_or(tmp_dir);
 
-        let mut write_paths: Vec<String> = cfg
-            .profile
-            .write_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        // Helper: canonicalize a path for Seatbelt profile embedding.
+        // Falls back to the original if canonicalization fails (path
+        // may not exist yet, e.g. socket files).
+        let canon = |p: &std::path::Path| -> String {
+            std::fs::canonicalize(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Build profile data from config. All paths must be
+        // canonicalized because Seatbelt resolves symlinks in access
+        // paths but stores profile paths as-is.
+        let mut read_paths: Vec<String> = cfg.profile.read_paths.iter().map(|p| canon(p)).collect();
+
+        let mut write_paths: Vec<String> =
+            cfg.profile.write_paths.iter().map(|p| canon(p)).collect();
 
         // Add socket dir to read paths so the agent can connect.
         let has_socket_dir = !cfg.socket_dir.as_os_str().is_empty();
         if has_socket_dir {
-            read_paths.push(cfg.socket_dir.to_string_lossy().into_owned());
+            read_paths.push(canon(&cfg.socket_dir));
         }
 
         // Add tmp_dir to write paths.
@@ -178,33 +187,24 @@ impl Sandbox for Darwin {
         // Add uv cache to read paths if it exists.
         if let Some(uv_cache) = Self::uv_cache_path() {
             if uv_cache.exists() {
-                read_paths.push(uv_cache.to_string_lossy().into_owned());
+                read_paths.push(canon(&uv_cache));
             }
         }
 
         let mut exec_paths: Vec<String> = Vec::new();
         let cmd_path = std::path::Path::new(cmd);
         if let Some(parent) = cmd_path.parent() {
-            let parent_str = parent.to_string_lossy().into_owned();
-            if !parent_str.is_empty() {
-                exec_paths.push(parent_str);
+            if !parent.as_os_str().is_empty() {
+                exec_paths.push(canon(parent));
             }
         }
 
         let control_socket = if has_socket_dir {
-            Some(
-                cfg.socket_dir
-                    .join("control.sock")
-                    .to_string_lossy()
-                    .into_owned(),
-            )
+            Some(canon(&cfg.socket_dir.join("control.sock")))
         } else {
             None
         };
-        let llm_socket = cfg
-            .network_proxy_socket
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned());
+        let llm_socket = cfg.network_proxy_socket.as_ref().map(|p| canon(p));
 
         let profile_data = darwin_profile::ProfileData {
             read_paths,

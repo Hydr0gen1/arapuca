@@ -82,15 +82,34 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     writeln!(profile, "(allow signal (target self))").unwrap();
     writeln!(profile).unwrap();
 
+    // Root directory: dyld needs to stat "/" during process bootstrap.
+    // Without this, the process receives SIGABRT before main() runs.
+    writeln!(profile, "; Root directory (dyld bootstrap)").unwrap();
+    writeln!(profile, "(allow file-read* (literal \"/\"))").unwrap();
+    writeln!(profile).unwrap();
+
+    // Ancestor directories for path traversal. Seatbelt requires
+    // explicit access to parent directories for realpath() resolution.
+    // /private and /private/var are needed because /var, /etc, and /tmp
+    // are symlinks into /private on macOS.
+    // /etc is a symlink to /private/etc — it must be readable for
+    // processes that open /etc/hosts, /etc/resolv.conf, etc.
+    writeln!(profile, "; Ancestor directories for path traversal").unwrap();
+    for ancestor in &["/opt", "/etc", "/private", "/private/var"] {
+        writeln!(profile, "(allow file-read* (literal \"{ancestor}\"))").unwrap();
+    }
+    writeln!(profile).unwrap();
+
     // System read paths (always allowed).
+    // Note: /System covers /System/Library and /System/Cryptexes (dyld
+    // shared cache on macOS 13+).
     writeln!(profile, "; System read paths").unwrap();
     for sys_path in &[
         "/usr",
         "/bin",
         "/opt/homebrew",
         "/Library/Frameworks",
-        "/System/Library",
-        "/private/var/db/dyld",
+        "/System",
         "/dev",
     ] {
         writeln!(profile, "(allow file-read* (subpath \"{sys_path}\"))").unwrap();
@@ -98,17 +117,25 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     writeln!(profile).unwrap();
 
     // Specific /etc files (not the whole directory).
-    writeln!(profile, "; Specific /etc files").unwrap();
+    // macOS paths: /etc -> /private/etc, so use canonical paths.
+    // Seatbelt resolves symlinks in access paths but stores profile
+    // paths as-is, so /etc/hosts would NOT match an access to
+    // /private/etc/hosts.
+    writeln!(profile, "; Specific /etc files (canonical paths)").unwrap();
     for etc_file in &[
-        "/etc/hosts",
-        "/etc/resolv.conf",
-        "/etc/localtime",
-        "/etc/ssl/cert.pem",
+        "/private/etc/hosts",
+        "/private/etc/resolv.conf",
+        "/private/etc/localtime",
+        "/private/etc/ssl/cert.pem",
     ] {
         writeln!(profile, "(allow file-read* (literal \"{etc_file}\"))").unwrap();
     }
     // Allow reading /etc/ssl directory for certificate lookup.
-    writeln!(profile, "(allow file-read* (subpath \"/etc/ssl/certs\"))").unwrap();
+    writeln!(
+        profile,
+        "(allow file-read* (subpath \"/private/etc/ssl/certs\"))"
+    )
+    .unwrap();
     writeln!(profile).unwrap();
 
     // User read paths.
@@ -272,6 +299,23 @@ mod tests {
 
         // Verify deny-default.
         assert!(content.contains("(deny default)"));
+
+        // Verify root directory access for dyld bootstrap.
+        assert!(content.contains("(allow file-read* (literal \"/\"))"));
+
+        // Verify ancestor directories for path traversal.
+        assert!(content.contains("(allow file-read* (literal \"/opt\"))"));
+        assert!(content.contains("(allow file-read* (literal \"/etc\"))"));
+        assert!(content.contains("(allow file-read* (literal \"/private\"))"));
+        assert!(content.contains("(allow file-read* (literal \"/private/var\"))"));
+
+        // Verify /etc paths use canonical /private/etc prefix.
+        assert!(content.contains("(allow file-read* (literal \"/private/etc/hosts\"))"));
+        assert!(content.contains("(allow file-read* (subpath \"/private/etc/ssl/certs\"))"));
+
+        // Verify /System is a subpath (covers /System/Library and
+        // /System/Cryptexes).
+        assert!(content.contains("(allow file-read* (subpath \"/System\"))"));
 
         // Verify read paths.
         assert!(content.contains("(allow file-read* (subpath \"/home/user/src\"))"));
