@@ -59,15 +59,26 @@ fn main() {
     let cmd = &args[cmd_idx];
     let cmd_args = &args[cmd_idx..];
 
-    // Validate command exists before applying restrictions (Landlock
-    // would block the stat after apply).
-    if std::fs::metadata(cmd).is_err() {
-        // Try PATH lookup.
-        if which(cmd).is_none() {
-            eprintln!("arapuca: command not found: {cmd}");
-            std::process::exit(1);
+    // Resolve the command to an absolute path before applying sandbox
+    // restrictions (Landlock would block the stat after apply). This
+    // also fixes execve() which, unlike execvp(), does NOT search PATH.
+    let cmd = if std::fs::metadata(cmd).is_ok() {
+        // Already an absolute or relative path that exists — use it.
+        // Canonicalize to handle relative paths.
+        std::fs::canonicalize(cmd)
+            .unwrap_or_else(|_| PathBuf::from(cmd))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        // Bare command name — resolve via PATH lookup.
+        match which(cmd) {
+            Some(path) => path.to_string_lossy().into_owned(),
+            None => {
+                eprintln!("arapuca: command not found: {cmd}");
+                std::process::exit(1);
+            }
         }
-    }
+    };
 
     // Apply sandbox restrictions. Fail-closed: exit non-zero if any
     // step fails. The subprocess never runs unsandboxed.

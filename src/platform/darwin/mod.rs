@@ -218,17 +218,24 @@ impl Sandbox for Darwin {
         let profile_path = darwin_profile::generate_profile(&tmp_dir, &profile_data)?;
 
         // Build the command: sandbox-exec -f profile.sb -- cmd args...
-        let mut actual_cmd = cmd.to_string();
+        // Canonicalize cmd so it matches the canonical exec_paths in
+        // the Seatbelt profile. Seatbelt does NOT resolve symlinks in
+        // the target binary path for process-exec checks.
+        let mut actual_cmd = canon(std::path::Path::new(cmd));
         let mut actual_args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
 
-        // Wrap with sandbox-exec.
+        // Wrap with sandbox-exec. Use the absolute path because the
+        // arapuca wrapper binary calls execve(), which does NOT search
+        // PATH. A bare "sandbox-exec" would fail with ENOENT.
+        let sandbox_exec = which_sandbox_exec()
+            .ok_or_else(|| Error::Process("sandbox-exec not found in PATH".into()))?;
         let sb_args = vec![
             "-f".to_string(),
             profile_path.to_string_lossy().into_owned(),
             "--".to_string(),
             actual_cmd,
         ];
-        actual_cmd = "sandbox-exec".to_string();
+        actual_cmd = sandbox_exec;
         let mut new_args = sb_args;
         new_args.extend(actual_args);
         actual_args = new_args;
@@ -351,6 +358,26 @@ impl Sandbox for Darwin {
     fn cgroups_available(&self) -> bool {
         false
     }
+}
+
+/// Resolve the absolute path to `sandbox-exec`.
+///
+/// The arapuca wrapper binary uses `execve()` (not `execvp()`), which
+/// requires an absolute path. A bare `"sandbox-exec"` would fail with
+/// ENOENT because `execve()` does not search PATH.
+fn which_sandbox_exec() -> Option<String> {
+    // Fast path: standard location on macOS.
+    if std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+        return Some("/usr/bin/sandbox-exec".into());
+    }
+    // Fallback: search PATH.
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        let candidate = std::path::Path::new(dir).join("sandbox-exec");
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
