@@ -191,11 +191,16 @@ impl Sandbox for Darwin {
             }
         }
 
+        // Canonicalize cmd early so exec_paths and actual_cmd use
+        // the same resolved path. Seatbelt does NOT resolve symlinks
+        // in the target binary path for process-exec checks.
+        let canonical_cmd = canon(std::path::Path::new(cmd));
+
         let mut exec_paths: Vec<String> = Vec::new();
-        let cmd_path = std::path::Path::new(cmd);
-        if let Some(parent) = cmd_path.parent() {
+        let cmd_canon_path = std::path::Path::new(&canonical_cmd);
+        if let Some(parent) = cmd_canon_path.parent() {
             if !parent.as_os_str().is_empty() {
-                exec_paths.push(canon(parent));
+                exec_paths.push(parent.to_string_lossy().into_owned());
             }
         }
 
@@ -218,10 +223,7 @@ impl Sandbox for Darwin {
         let profile_path = darwin_profile::generate_profile(&tmp_dir, &profile_data)?;
 
         // Build the command: sandbox-exec -f profile.sb -- cmd args...
-        // Canonicalize cmd so it matches the canonical exec_paths in
-        // the Seatbelt profile. Seatbelt does NOT resolve symlinks in
-        // the target binary path for process-exec checks.
-        let mut actual_cmd = canon(std::path::Path::new(cmd));
+        let mut actual_cmd = canonical_cmd;
         let mut actual_args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
 
         // Wrap with sandbox-exec. Use the absolute path because the
