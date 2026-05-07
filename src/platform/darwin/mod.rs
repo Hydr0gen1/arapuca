@@ -115,7 +115,7 @@ impl Darwin {
     /// `getppid()` every 2 seconds. If the parent PID changes (process
     /// was reparented to init/launchd), the subprocess is killed.
     fn start_parent_watchdog(child_pid: u32) {
-        let original_ppid = std::process::id();
+        let original_ppid = unsafe { libc::getppid() } as u32;
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
