@@ -1,4 +1,4 @@
-.PHONY: build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static install uninstall
+.PHONY: build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static package install uninstall
 
 ifeq ($(shell uname -s),Linux)
   FEATURES ?= microvm
@@ -104,12 +104,12 @@ clean:
 static:
 	cargo build --release --target x86_64-unknown-linux-musl
 
-# Install static library, header, and pkg-config file.
-# Runs its own cargo rustc to both build and capture native-static-libs
-# in one invocation. Override INSTALL_FEATURES to include optional
-# features (e.g., make install INSTALL_FEATURES=microvm).
+# Build artifacts needed for installation: release library, C header,
+# and native-static-libs list for the pkg-config file.
+# Run as your normal user; then 'sudo make install' to copy files.
+# Override INSTALL_FEATURES for optional features (e.g., make package INSTALL_FEATURES=microvm).
 INSTALL_FEATURES ?=
-install: header
+package: header
 	touch src/lib.rs
 	mkdir -p target
 	CARGO_TERM_COLOR=never cargo rustc --release --lib \
@@ -119,6 +119,15 @@ install: header
 	    | sed 's/.*native-static-libs: //' > target/native-static-libs.txt
 	test -s target/native-static-libs.txt || \
 	    { echo "ERROR: failed to capture native-static-libs"; exit 1; }
+
+# Install pre-built artifacts. Run 'make package' first (as non-root).
+install:
+	@test -f target/release/libarapuca.a || \
+	    { echo "ERROR: target/release/libarapuca.a not found — run 'make package' first"; exit 1; }
+	@test -f include/arapuca.h || \
+	    { echo "ERROR: include/arapuca.h not found — run 'make header' first"; exit 1; }
+	@test -s target/native-static-libs.txt || \
+	    { echo "ERROR: target/native-static-libs.txt not found — run 'make package' first"; exit 1; }
 	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
 	install -d $(DESTDIR)$(PREFIX)/include
 	install -m 644 target/release/libarapuca.a $(DESTDIR)$(LIBDIR)/
