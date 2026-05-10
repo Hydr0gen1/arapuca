@@ -311,11 +311,16 @@ fn tier2_eperm_syscalls() -> Vec<i64> {
 /// Summary of the seccomp filter policy for audit reporting.
 pub(crate) struct SeccompSummary {
     pub tier1_kill_count: usize,
+    /// Count of unconditional EPERM syscalls only (symlinkat, linkat, etc.).
+    /// Does not include argument-filtered rules (socket domain check,
+    /// prctl argument check, execveat AT_EMPTY_PATH check, clone namespace
+    /// flags check) — those are reported as separate bool flags below.
     pub tier2_eperm_count: usize,
     pub socket_filter: bool,
     pub prctl_filter: bool,
     pub clone_ns_filter: bool,
     pub clone3_enosys: bool,
+    pub execveat_filter: bool,
 }
 
 // NOTE: filter flags are hardcoded to match build_filter(). Update
@@ -328,6 +333,7 @@ pub(crate) fn summary() -> SeccompSummary {
         prctl_filter: true,
         clone_ns_filter: true,
         clone3_enosys: true,
+        execveat_filter: true,
     }
 }
 
