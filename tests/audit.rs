@@ -325,3 +325,115 @@ fn env_filtering_audited() {
         _ => unreachable!(),
     }
 }
+
+#[test]
+fn signal_killed_process() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+    let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+    let cfg = basic_config(sink);
+
+    let sb = new().unwrap();
+    let mut proc = sb.launch(&cfg, "/bin/sleep", &["60"]).unwrap();
+
+    let pid = proc.pid();
+    // SAFETY: pid is a valid child PID.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+    let status = proc.wait().unwrap();
+    assert_eq!(status.signal(), Some(9));
+    proc.cleanup();
+
+    let events = vec_sink.0.lock().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| matches!(e, AuditEvent::ProcessExited { .. }));
+    match exited.unwrap() {
+        AuditEvent::ProcessExited {
+            exit_code, signal, ..
+        } => {
+            assert_eq!(*exit_code, None);
+            assert_eq!(*signal, Some(9));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn spawn_failure_emits_layer_failed() {
+    let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+    let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+    let cfg = basic_config(sink);
+
+    let sb = new().unwrap();
+    let result = sb.launch(&cfg, "/nonexistent-binary-xyz-12345", &[]);
+    assert!(result.is_err());
+
+    let events = vec_sink.0.lock().unwrap();
+    let failed = events
+        .iter()
+        .find(|e| matches!(e, AuditEvent::LayerFailed { .. }));
+    match failed.unwrap() {
+        AuditEvent::LayerFailed { layer, error, .. } => {
+            assert_eq!(*layer, SandboxLayer::ProcessSpawn);
+            assert!(error.contains("spawn failed"));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn sandbox_ready_present_before_spawn_failure() {
+    let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+    let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+    let cfg = basic_config(sink);
+
+    let sb = new().unwrap();
+    let result = sb.launch(&cfg, "/nonexistent-binary-xyz-12345", &[]);
+    assert!(result.is_err());
+
+    let events = vec_sink.0.lock().unwrap();
+    let names = event_names(&events);
+    assert!(names.contains(&"SandboxReady"));
+    assert!(!names.contains(&"ProcessStarted"));
+}
+
+#[test]
+fn mandatory_sink_abort() {
+    struct PanickingSink;
+    impl AuditSink for PanickingSink {
+        fn emit(&self, _event: AuditEvent) {
+            panic!("mandatory sink panics");
+        }
+        fn is_mandatory(&self) -> bool {
+            true
+        }
+    }
+
+    let sink: Arc<dyn AuditSink> = Arc::new(PanickingSink);
+    let cfg = Config {
+        profile: Profile::default(),
+        socket_dir: std::path::PathBuf::new(),
+        task_id: "mandatory-test".into(),
+        phase: "test".into(),
+        work_dir: None,
+        stdin: None,
+        stdout: None,
+        stderr: None,
+        extra_fds: Vec::new(),
+        network_proxy_socket: None,
+        env: Vec::new(),
+        audit_sink: Some(sink),
+        audit_verbosity: AuditVerbosity::Standard,
+        audit_principal: None,
+        audit_correlation_id: None,
+    };
+
+    let sb = new().unwrap();
+    let result = sb.launch(&cfg, "/bin/true", &[]);
+    assert!(
+        result.is_err(),
+        "mandatory panicking sink should cause launch failure"
+    );
+}
