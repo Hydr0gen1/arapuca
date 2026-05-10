@@ -17,7 +17,9 @@ use crate::{Error, Profile};
 
 /// Apply resource limits from the profile to the current process.
 ///
-/// Sets RLIMIT_FSIZE only. Memory and PID limits are enforced via
+/// Sets RLIMIT_CORE=0 unconditionally (prevents core dumps from
+/// leaking secrets), and RLIMIT_FSIZE if configured. Memory and PID
+/// limits are enforced via
 /// cgroups v2 (`memory.max`, `pids.max`), not RLIMIT_AS/RLIMIT_NPROC.
 /// Both are system-wide per-UID limits that break sandboxed workloads:
 /// RLIMIT_AS kills Go/JVM/.NET at startup, and RLIMIT_NPROC fails
@@ -32,6 +34,7 @@ use crate::{Error, Profile};
 /// Returns an error if any `prlimit64` call fails.
 #[must_use = "rlimit errors must be handled"]
 pub fn apply(profile: &Profile) -> crate::Result<()> {
+    set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
     if profile.max_file_size_mb > 0 {
         let bytes = profile.max_file_size_mb * 1024 * 1024;
         set_rlimit(libc::RLIMIT_FSIZE, bytes, "RLIMIT_FSIZE")?;
@@ -44,6 +47,7 @@ pub fn apply(profile: &Profile) -> crate::Result<()> {
 /// Used by the binary. Reads `ARAPUCA_RLIMIT_AS`, `ARAPUCA_RLIMIT_NPROC`,
 /// `ARAPUCA_RLIMIT_CPU`, `ARAPUCA_RLIMIT_FSIZE` from the environment.
 pub fn apply_from_env() -> crate::Result<()> {
+    set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_AS")? {
         set_rlimit(libc::RLIMIT_AS, v, "RLIMIT_AS")?;
     }
@@ -151,6 +155,19 @@ mod tests {
             nproc_before, nproc_after,
             "apply() must not modify RLIMIT_NPROC"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_sets_rlimit_core_to_zero() {
+        let profile = Profile::default();
+        apply(&profile).unwrap();
+
+        let mut rlim: libc::rlimit64 = unsafe { std::mem::zeroed() };
+        // SAFETY: prlimit64 with pid=0 reads the current process limit.
+        unsafe { libc::prlimit64(0, libc::RLIMIT_CORE, std::ptr::null(), &mut rlim) };
+        assert_eq!(rlim.rlim_cur, 0, "apply() must set RLIMIT_CORE soft to 0");
+        assert_eq!(rlim.rlim_max, 0, "apply() must set RLIMIT_CORE hard to 0");
     }
 
     #[cfg(target_os = "linux")]
