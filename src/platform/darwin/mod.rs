@@ -13,7 +13,6 @@
 
 mod darwin_profile;
 
-use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -309,69 +308,20 @@ impl Sandbox for Darwin {
         crate::platform::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         crate::platform::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        // Extra FD inheritance — validate and remap using the same
-        // two-pass approach as other.rs to handle overlapping source/target FDs.
-        // Darwin allows 8 extra FDs (no audit pipe slot, unlike linux.rs's 7).
-        let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
-        for &fd in &fds_to_inherit {
-            if fd < 3 {
-                return Err(Error::Validation(format!(
-                    "extra FD must be >= 3, got {fd}"
-                )));
-            }
-        }
-        {
-            let mut sorted = fds_to_inherit.clone();
-            sorted.sort();
-            if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
-                return Err(Error::Validation(format!("duplicate extra FD: {}", dup[0])));
-            }
-        }
-        if fds_to_inherit.len() > 8 {
-            return Err(Error::Validation(format!(
-                "too many extra FDs ({}, max 8)",
-                fds_to_inherit.len()
-            )));
-        }
+        super::fd::validate_extra_fds(&cfg.extra_fds, cfg)?;
+        let mut fds_to_inherit = std::mem::ManuallyDrop::new(cfg.extra_fds.clone());
 
         // SAFETY: pre_exec runs between fork and exec. Only async-signal-safe
-        // functions are used (setsid, fcntl, dup2, close). No allocation or
-        // std::fs operations.
+        // functions are used (setsid, fcntl, dup2, close). ManuallyDrop
+        // prevents free() on the Vec in the child process.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-
-                let n = fds_to_inherit.len();
-                if n > 0 {
-                    let mut safe_fds = [0i32; 8];
-                    for (i, &fd) in fds_to_inherit.iter().enumerate() {
-                        if fd >= 3 && fd < 3 + n as i32 {
-                            let safe = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3 + n as i32);
-                            if safe == -1 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            safe_fds[i] = safe;
-                        } else {
-                            safe_fds[i] = fd;
-                        }
-                    }
-                    for (i, &fd) in safe_fds.iter().enumerate().take(n) {
-                        let target = (3 + i) as libc::c_int;
-                        if fd != target {
-                            if libc::dup2(fd, target) == -1 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            libc::close(fd);
-                        }
-                        let flags = libc::fcntl(target, libc::F_GETFD);
-                        if flags != -1 {
-                            libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                        }
-                    }
+                if !fds_to_inherit.is_empty() {
+                    super::fd::remap_fds(&mut fds_to_inherit)?;
                 }
-
                 Ok(())
             });
         }
@@ -484,7 +434,7 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error for FD 0"),
         };
-        assert!(err.contains("extra FD must be >= 3"), "got: {err}");
+        assert!(err.contains("stdin/stdout/stderr"), "got: {err}");
     }
 
     #[test]
@@ -494,17 +444,17 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error for duplicate FDs"),
         };
-        assert!(err.contains("duplicate extra FD"), "got: {err}");
+        assert!(err.contains("duplicate FD"), "got: {err}");
     }
 
     #[test]
     fn darwin_extra_fds_rejects_too_many() {
-        let fds: Vec<i32> = (3..12).collect();
+        let fds: Vec<i32> = (3..20).collect();
         let cfg = test_config_with_extra_fds(fds);
         let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error for too many FDs"),
         };
-        assert!(err.contains("too many extra FDs"), "got: {err}");
+        assert!(err.contains("too many FDs"), "got: {err}");
     }
 }

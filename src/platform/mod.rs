@@ -13,6 +13,8 @@ use crate::{Config, process::Process};
 
 #[cfg(target_os = "macos")]
 mod darwin;
+#[cfg(unix)]
+mod fd;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "linux", feature = "microvm"))]

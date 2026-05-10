@@ -4,7 +4,6 @@
 //! no seccomp, no cgroups, no network namespace. Suitable for development
 //! and testing only. Production workloads should use Linux.
 
-use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::Arc;
@@ -51,7 +50,6 @@ impl Sandbox for Other {
                     .map(sanitize_audit_string),
             })?;
 
-            // All security layers are unavailable on this platform.
             for layer in [
                 SandboxLayer::Landlock,
                 SandboxLayer::Seccomp,
@@ -59,7 +57,6 @@ impl Sandbox for Other {
                 SandboxLayer::NetworkNamespace,
                 SandboxLayer::Rlimit,
                 SandboxLayer::NoNewPrivs,
-                SandboxLayer::Setsid,
                 SandboxLayer::Pdeathsig,
             ] {
                 ctx.emit(AuditEvent::LayerSkipped {
@@ -69,9 +66,19 @@ impl Sandbox for Other {
                 })?;
             }
 
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::Setsid,
+                detail: None,
+            })?;
+
             ctx.emit(AuditEvent::SandboxReady {
                 timestamp: ctx.timestamp(),
-                applied_layers: vec![SandboxLayer::EnvFilter, SandboxLayer::FdSanitization],
+                applied_layers: vec![
+                    SandboxLayer::EnvFilter,
+                    SandboxLayer::FdSanitization,
+                    SandboxLayer::Setsid,
+                ],
                 skipped_layers: vec![
                     SandboxLayer::Landlock,
                     SandboxLayer::Seccomp,
@@ -79,7 +86,6 @@ impl Sandbox for Other {
                     SandboxLayer::NetworkNamespace,
                     SandboxLayer::Rlimit,
                     SandboxLayer::NoNewPrivs,
-                    SandboxLayer::Setsid,
                     SandboxLayer::Pdeathsig,
                 ],
             })?;
@@ -114,61 +120,22 @@ impl Sandbox for Other {
         super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        // Extra FD inheritance — validate and remap using the same
-        // two-pass approach as linux.rs to handle overlapping source/target FDs.
-        let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
-        for &fd in &fds_to_inherit {
-            if fd < 3 {
-                return Err(Error::Validation(format!(
-                    "extra FD must be >= 3, got {fd}"
-                )));
-            }
-        }
-        {
-            let mut sorted = fds_to_inherit.clone();
-            sorted.sort();
-            if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
-                return Err(Error::Validation(format!("duplicate extra FD: {}", dup[0])));
-            }
-        }
-        if fds_to_inherit.len() > 8 {
-            return Err(Error::Validation(format!(
-                "too many extra FDs ({}, max 8)",
-                fds_to_inherit.len()
-            )));
-        }
-        if !fds_to_inherit.is_empty() {
-            unsafe {
-                command.pre_exec(move || {
-                    let n = fds_to_inherit.len();
-                    let mut safe_fds = [0i32; 8];
-                    for (i, &fd) in fds_to_inherit.iter().enumerate() {
-                        if fd >= 3 && fd < 3 + n as i32 {
-                            let safe = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3 + n as i32);
-                            if safe == -1 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            safe_fds[i] = safe;
-                        } else {
-                            safe_fds[i] = fd;
-                        }
-                    }
-                    for (i, &fd) in safe_fds.iter().enumerate().take(n) {
-                        let target = (3 + i) as libc::c_int;
-                        if fd != target {
-                            if libc::dup2(fd, target) == -1 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            libc::close(fd);
-                        }
-                        let flags = libc::fcntl(target, libc::F_GETFD);
-                        if flags != -1 {
-                            libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                        }
-                    }
-                    Ok(())
-                });
-            }
+        super::fd::validate_extra_fds(&cfg.extra_fds, cfg)?;
+        let mut fds_to_inherit = std::mem::ManuallyDrop::new(cfg.extra_fds.clone());
+
+        // SAFETY: pre_exec runs between fork and exec. Only async-signal-safe
+        // functions are used (setsid, fcntl, dup2, close). ManuallyDrop
+        // prevents free() on the Vec in the child process.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if !fds_to_inherit.is_empty() {
+                    super::fd::remap_fds(&mut fds_to_inherit)?;
+                }
+                Ok(())
+            });
         }
 
         let child = command
