@@ -159,12 +159,15 @@ impl Sandbox for Linux {
             // Landlock/seccomp/rlimit/NO_NEW_PRIVS.
             let has_paths =
                 !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
-            let reason = if wrapper.is_none() && has_paths {
-                log::warn!("arapuca wrapper binary not found — no Landlock/seccomp applied");
-                SkipReason::ComponentMissing("wrapper binary not found".into())
-            } else {
-                SkipReason::NotConfigured
-            };
+            if wrapper.is_none() && has_paths {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(Error::Process(
+                    "filesystem restrictions requested but arapuca wrapper binary \
+                     not found — refusing to launch without Landlock/seccomp enforcement"
+                        .into(),
+                ));
+            }
+            let reason = SkipReason::NotConfigured;
             for layer in [
                 SandboxLayer::Landlock,
                 SandboxLayer::Rlimit,
