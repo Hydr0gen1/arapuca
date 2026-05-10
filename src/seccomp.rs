@@ -250,6 +250,16 @@ fn build_filter() -> crate::Result<BpfProgram> {
     Ok(kill_prog)
 }
 
+// LSM syscalls (kernel 6.8+, generic table — same NR on x86_64/aarch64).
+// Not yet in the libc crate for these architectures.
+// Reference: include/uapi/asm-generic/unistd.h
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SYS_LSM_GET_SELF_ATTR: i64 = 459;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SYS_LSM_SET_SELF_ATTR: i64 = 460;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SYS_LSM_LIST_MODULES: i64 = 461;
+
 /// Tier 1 syscalls: KILL_PROCESS on match.
 /// No legitimate use by sandboxed agents.
 fn tier1_kill_syscalls() -> Vec<i64> {
@@ -292,6 +302,17 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_landlock_create_ruleset,
         libc::SYS_landlock_add_rule,
         libc::SYS_landlock_restrict_self,
+        libc::SYS_quotactl,
+        libc::SYS_quotactl_fd,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_acct,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        SYS_LSM_GET_SELF_ATTR,
+        SYS_LSM_SET_SELF_ATTR,
+        SYS_LSM_LIST_MODULES,
     ]
 }
 
@@ -369,7 +390,7 @@ mod tests {
     fn tier1_count_is_exact() {
         assert_eq!(
             tier1_kill_syscalls().len(),
-            38,
+            49,
             "tier1 count changed — update this assertion if intentional"
         );
     }
@@ -403,6 +424,14 @@ mod tests {
         for nr in &syscalls {
             assert!(seen.insert(nr), "duplicate tier2 syscall: {nr}");
         }
+    }
+
+    #[test]
+    fn no_tier_overlap() {
+        let t1: std::collections::HashSet<i64> = tier1_kill_syscalls().into_iter().collect();
+        let t2: std::collections::HashSet<i64> = tier2_eperm_syscalls().into_iter().collect();
+        let overlap: Vec<_> = t1.intersection(&t2).collect();
+        assert!(overlap.is_empty(), "syscalls in both tiers: {overlap:?}");
     }
 
     #[test]
@@ -740,5 +769,35 @@ mod tests {
             code, 42,
             "AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW should be blocked"
         );
+    }
+
+    #[test]
+    fn tier1_quotactl_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: quotactl with invalid args — triggers filter before kernel checks.
+            unsafe { libc::syscall(libc::SYS_quotactl, 0i32, std::ptr::null::<u8>(), 0i32, 0u64) };
+        });
+        assert!(!exited, "quotactl should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn tier1_lsm_set_self_attr_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: raw syscall with invalid args — filter kills before kernel processes.
+            unsafe { libc::syscall(SYS_LSM_SET_SELF_ATTR, 0u64, 0u64, 0u64, 0u64) };
+        });
+        assert!(!exited, "lsm_set_self_attr should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn tier1_lsm_get_self_attr_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: raw syscall with invalid args — filter kills before kernel processes.
+            unsafe { libc::syscall(SYS_LSM_GET_SELF_ATTR, 0u64, 0u64, 0u64, 0u64) };
+        });
+        assert!(!exited, "lsm_get_self_attr should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
     }
 }
