@@ -334,6 +334,13 @@ impl Sandbox for Linux {
                 )));
             }
         }
+        {
+            let mut sorted = fds_to_inherit.clone();
+            sorted.sort();
+            if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
+                return Err(Error::Validation(format!("duplicate extra FD: {}", dup[0])));
+            }
+        }
         if fds_to_inherit.len() > 7 {
             return Err(Error::Validation(format!(
                 "too many extra FDs ({}, max 7)",
