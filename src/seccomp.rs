@@ -366,13 +366,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tier1_syscalls_not_empty() {
-        assert!(!tier1_kill_syscalls().is_empty());
+    fn tier1_count_is_exact() {
+        assert_eq!(
+            tier1_kill_syscalls().len(),
+            38,
+            "tier1 count changed — update this assertion if intentional"
+        );
     }
 
     #[test]
-    fn tier2_syscalls_not_empty() {
-        assert!(!tier2_eperm_syscalls().is_empty());
+    fn tier2_count_is_exact() {
+        #[cfg(target_arch = "x86_64")]
+        let expected = 5;
+        #[cfg(target_arch = "aarch64")]
+        let expected = 3;
+        assert_eq!(
+            tier2_eperm_syscalls().len(),
+            expected,
+            "tier2 count changed — update this assertion if intentional"
+        );
+    }
+
+    #[test]
+    fn tier1_no_duplicates() {
+        let syscalls = tier1_kill_syscalls();
+        let mut seen = std::collections::HashSet::new();
+        for nr in &syscalls {
+            assert!(seen.insert(nr), "duplicate tier1 syscall: {nr}");
+        }
+    }
+
+    #[test]
+    fn tier2_no_duplicates() {
+        let syscalls = tier2_eperm_syscalls();
+        let mut seen = std::collections::HashSet::new();
+        for nr in &syscalls {
+            assert!(seen.insert(nr), "duplicate tier2 syscall: {nr}");
+        }
     }
 
     #[test]
