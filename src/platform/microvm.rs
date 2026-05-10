@@ -281,6 +281,7 @@ impl Sandbox for MicroVm {
                 net_ips.as_ref(),
                 &tmp_dir,
                 audit_ctx,
+                &vm_cfg.write_files,
             )?;
 
             // Store passt in the Process for deterministic cleanup.
@@ -335,6 +336,7 @@ fn launch_vm(
     net_ips: Option<&(String, String, Vec<String>)>,
     tmp_dir: &std::path::Path,
     audit_ctx: Option<AuditContext>,
+    write_files: &[crate::GuestFile],
 ) -> crate::Result<Process> {
     // SAFETY: the passt DHCP reader thread may still be alive, but
     // it only holds a BufReader on passt's stderr pipe and does not
@@ -403,6 +405,7 @@ fn launch_vm(
             net_fd,
             net_ips,
             None,
+            write_files,
         );
     }
 
@@ -442,6 +445,7 @@ pub(crate) fn exec_vm(
     net_fd: Option<i32>,
     net_ips: Option<&(String, String, Vec<String>)>,
     persistent: Option<&PersistentVmOpts<'_>>,
+    write_files: &[crate::GuestFile],
 ) -> ! {
     if let Err(e) = exec_vm_inner(
         vm_cfg,
@@ -455,6 +459,7 @@ pub(crate) fn exec_vm(
         net_fd,
         net_ips,
         persistent,
+        write_files,
     ) {
         // Post-fork: use raw write(2) to avoid mutex/allocation deadlocks.
         // We lose the dynamic error message but avoid the risk of hanging
@@ -480,6 +485,7 @@ fn exec_vm_inner(
     net_fd: Option<i32>,
     net_ips: Option<&(String, String, Vec<String>)>,
     persistent: Option<&PersistentVmOpts<'_>>,
+    write_files: &[crate::GuestFile],
 ) -> crate::Result<()> {
     // SAFETY: all krun_sys calls operate on a context ID and take
     // C strings. The context is process-local (this is the forked
@@ -714,6 +720,29 @@ fn exec_vm_inner(
     init_script.push_str(
         "chmod 755 /root /usr/bin /usr/lib /usr/lib64 /usr/sbin /usr/libexec 2>/dev/null\n",
     );
+
+    // Write guest files from the write_files configuration.
+    for gf in write_files {
+        crate::validate_guest_path(&gf.path)
+            .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
+        if let Some(perms) = &gf.permissions {
+            crate::validate_guest_permissions(perms)
+                .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
+        }
+        let qpath = shell_quote(&gf.path);
+        if let Some(parent) = std::path::Path::new(&gf.path).parent() {
+            if parent != std::path::Path::new("/") {
+                let qdir = shell_quote(&parent.to_string_lossy());
+                init_script.push_str(&format!("mkdir -p -- {qdir}\n"));
+            }
+        }
+        let qcontent = shell_quote(&gf.content);
+        init_script.push_str(&format!("printf '%s' {qcontent} > {qpath}\n"));
+        if let Some(perms) = &gf.permissions {
+            let qperms = shell_quote(perms);
+            init_script.push_str(&format!("chmod -- {qperms} {qpath}\n"));
+        }
+    }
 
     // For persistent VMs: mount agent-bin share and start the agent.
     // For ephemeral VMs: exec the user's command directly.

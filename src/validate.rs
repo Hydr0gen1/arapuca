@@ -28,6 +28,39 @@ pub fn sanitize_task_id(id: &str) -> crate::Result<&str> {
     Ok(id)
 }
 
+/// Validate a guest file path (must be absolute, no `..` components).
+pub fn validate_guest_path(path: &str) -> crate::Result<()> {
+    if !path.starts_with('/') {
+        return Err(Error::Validation("guest path must be absolute".into()));
+    }
+    if path.split('/').any(|c| c == "..") {
+        return Err(Error::Validation(format!(
+            "guest path contains '..': {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate guest file permissions (3-4 octal digits, no setuid/setgid/sticky).
+pub fn validate_guest_permissions(perms: &str) -> crate::Result<()> {
+    if perms.len() < 3 || perms.len() > 4 {
+        return Err(Error::Validation(format!(
+            "permissions must be 3-4 octal digits: {perms}"
+        )));
+    }
+    if !perms.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(Error::Validation(format!(
+            "permissions must be octal digits: {perms}"
+        )));
+    }
+    if perms.len() == 4 && perms.as_bytes()[0] != b'0' {
+        return Err(Error::Validation(format!(
+            "setuid/setgid/sticky bits not allowed: {perms}"
+        )));
+    }
+    Ok(())
+}
+
 /// Reject paths that resolve to `/sys/fs/cgroup`.
 ///
 /// Defense-in-depth: prevents a sandboxed process from modifying its own
@@ -177,6 +210,42 @@ mod tests {
             normalize_path(&PathBuf::from("/a/b/../c")),
             PathBuf::from("/a/c")
         );
+    }
+
+    #[test]
+    fn guest_path_absolute_ok() {
+        assert!(validate_guest_path("/etc/hostname").is_ok());
+    }
+
+    #[test]
+    fn guest_path_relative_rejected() {
+        assert!(validate_guest_path("relative/path").is_err());
+    }
+
+    #[test]
+    fn guest_path_dotdot_rejected() {
+        assert!(validate_guest_path("/tmp/../../etc/shadow").is_err());
+    }
+
+    #[test]
+    fn permissions_valid_octal() {
+        assert!(validate_guest_permissions("644").is_ok());
+        assert!(validate_guest_permissions("0755").is_ok());
+        assert!(validate_guest_permissions("0600").is_ok());
+    }
+
+    #[test]
+    fn permissions_setuid_rejected() {
+        assert!(validate_guest_permissions("4755").is_err());
+        assert!(validate_guest_permissions("2755").is_err());
+        assert!(validate_guest_permissions("6755").is_err());
+    }
+
+    #[test]
+    fn permissions_non_octal_rejected() {
+        assert!(validate_guest_permissions("abc").is_err());
+        assert!(validate_guest_permissions("--reference=/etc/shadow").is_err());
+        assert!(validate_guest_permissions("u+s").is_err());
     }
 
     #[test]

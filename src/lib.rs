@@ -41,7 +41,9 @@ pub use error::Error;
 pub use profile::{
     Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
 };
-pub use validate::{reject_cgroup_paths, sanitize_task_id};
+pub use validate::{
+    reject_cgroup_paths, sanitize_task_id, validate_guest_path, validate_guest_permissions,
+};
 
 /// Result type for arapuca operations.
 pub type Result<T> = std::result::Result<T, Error>;

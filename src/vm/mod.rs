@@ -195,6 +195,7 @@ pub fn start(opts: &StartOpts) -> crate::Result<StartResult> {
                 net_fd,
                 net_ips.as_ref(),
                 Some(&persistent_opts),
+                &[],
             )
         }
     }
