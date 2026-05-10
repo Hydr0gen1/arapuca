@@ -322,6 +322,22 @@ impl Sandbox for Linux {
 
         let mut fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
 
+        // Validate extra FDs before creating any resources that would
+        // need cleanup on error.
+        for &fd in &fds_to_inherit {
+            if fd < 3 {
+                return Err(Error::Validation(format!(
+                    "extra FD must be >= 3, got {fd}"
+                )));
+            }
+        }
+        if fds_to_inherit.len() > 7 {
+            return Err(Error::Validation(format!(
+                "too many extra FDs ({}, max 7)",
+                fds_to_inherit.len()
+            )));
+        }
+
         // ── Audit pipe for wrapper binary verification ─────────────
         // When auditing is active and the wrapper binary is used, create
         // a pipe so the wrapper can report which layers it actually
@@ -399,18 +415,35 @@ impl Sandbox for Linux {
 
                 // Map extra FDs to deterministic positions (3, 4, ...).
                 // The Go orchestrator expects the nonce pipe at FD 3.
+                //
+                // Two-pass approach to handle overlapping source/target
+                // FDs: first move any source FD that falls inside the
+                // target range [3, 3+N) to a safe position above it,
+                // then map from safe positions to targets.
+                let n = fds_to_inherit.len();
+                let mut safe_fds = [0i32; 8];
                 for (i, &fd) in fds_to_inherit.iter().enumerate() {
-                    let target_fd = (3 + i) as libc::c_int;
-                    if fd != target_fd {
-                        if libc::dup2(fd, target_fd) == -1 {
+                    if fd >= 3 && fd < 3 + n as i32 {
+                        let safe = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3 + n as i32);
+                        if safe == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        safe_fds[i] = safe;
+                    } else {
+                        safe_fds[i] = fd;
+                    }
+                }
+                for (i, &fd) in safe_fds.iter().enumerate().take(n) {
+                    let target = (3 + i) as libc::c_int;
+                    if fd != target {
+                        if libc::dup2(fd, target) == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
                         libc::close(fd);
                     }
-                    // Clear CLOEXEC so the FD survives exec.
-                    let flags = libc::fcntl(target_fd, libc::F_GETFD);
+                    let flags = libc::fcntl(target, libc::F_GETFD);
                     if flags != -1 {
-                        libc::fcntl(target_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                        libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                     }
                 }
 
