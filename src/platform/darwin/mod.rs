@@ -13,6 +13,7 @@
 
 mod darwin_profile;
 
+use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -308,11 +309,69 @@ impl Sandbox for Darwin {
         crate::platform::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         crate::platform::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        // Setsid: detach from host's terminal session (same as Linux).
-        // SAFETY: setsid is a simple setter with no pointer arguments.
+        // Extra FD inheritance — validate and remap using the same
+        // two-pass approach as other.rs to handle overlapping source/target FDs.
+        // Darwin allows 8 extra FDs (no audit pipe slot, unlike linux.rs's 7).
+        let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
+        for &fd in &fds_to_inherit {
+            if fd < 3 {
+                return Err(Error::Validation(format!(
+                    "extra FD must be >= 3, got {fd}"
+                )));
+            }
+        }
+        {
+            let mut sorted = fds_to_inherit.clone();
+            sorted.sort();
+            if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
+                return Err(Error::Validation(format!("duplicate extra FD: {}", dup[0])));
+            }
+        }
+        if fds_to_inherit.len() > 8 {
+            return Err(Error::Validation(format!(
+                "too many extra FDs ({}, max 8)",
+                fds_to_inherit.len()
+            )));
+        }
+
+        // SAFETY: pre_exec runs between fork and exec. Only async-signal-safe
+        // functions are used (setsid, fcntl, dup2, close). No allocation or
+        // std::fs operations.
         unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
+                let n = fds_to_inherit.len();
+                if n > 0 {
+                    let mut safe_fds = [0i32; 8];
+                    for (i, &fd) in fds_to_inherit.iter().enumerate() {
+                        if fd >= 3 && fd < 3 + n as i32 {
+                            let safe = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3 + n as i32);
+                            if safe == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            safe_fds[i] = safe;
+                        } else {
+                            safe_fds[i] = fd;
+                        }
+                    }
+                    for (i, &fd) in safe_fds.iter().enumerate().take(n) {
+                        let target = (3 + i) as libc::c_int;
+                        if fd != target {
+                            if libc::dup2(fd, target) == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            libc::close(fd);
+                        }
+                        let flags = libc::fcntl(target, libc::F_GETFD);
+                        if flags != -1 {
+                            libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                        }
+                    }
+                }
+
                 Ok(())
             });
         }
@@ -396,5 +455,56 @@ mod tests {
         assert_eq!(Darwin::cpu_pct_to_seconds(0, 30), 0);
         // 0 duration = no limit.
         assert_eq!(Darwin::cpu_pct_to_seconds(200, 0), 0);
+    }
+
+    fn test_config_with_extra_fds(fds: Vec<i32>) -> crate::Config {
+        crate::Config {
+            profile: crate::Profile::default(),
+            socket_dir: std::path::PathBuf::new(),
+            task_id: "test".into(),
+            phase: "test".into(),
+            work_dir: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            extra_fds: fds,
+            network_proxy_socket: None,
+            env: vec![],
+            audit_sink: None,
+            audit_verbosity: crate::audit::AuditVerbosity::default(),
+            audit_principal: None,
+            audit_correlation_id: None,
+        }
+    }
+
+    #[test]
+    fn darwin_extra_fds_rejects_stdin() {
+        let cfg = test_config_with_extra_fds(vec![0]);
+        let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for FD 0"),
+        };
+        assert!(err.contains("extra FD must be >= 3"), "got: {err}");
+    }
+
+    #[test]
+    fn darwin_extra_fds_rejects_duplicates() {
+        let cfg = test_config_with_extra_fds(vec![5, 5]);
+        let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for duplicate FDs"),
+        };
+        assert!(err.contains("duplicate extra FD"), "got: {err}");
+    }
+
+    #[test]
+    fn darwin_extra_fds_rejects_too_many() {
+        let fds: Vec<i32> = (3..12).collect();
+        let cfg = test_config_with_extra_fds(fds);
+        let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for too many FDs"),
+        };
+        assert!(err.contains("too many extra FDs"), "got: {err}");
     }
 }
