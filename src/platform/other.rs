@@ -114,22 +114,49 @@ impl Sandbox for Other {
         super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        // Extra FD inheritance.
+        // Extra FD inheritance — validate and remap using the same
+        // two-pass approach as linux.rs to handle overlapping source/target FDs.
         let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
+        for &fd in &fds_to_inherit {
+            if fd < 3 {
+                return Err(Error::Validation(format!(
+                    "extra FD must be >= 3, got {fd}"
+                )));
+            }
+        }
+        if fds_to_inherit.len() > 8 {
+            return Err(Error::Validation(format!(
+                "too many extra FDs ({}, max 8)",
+                fds_to_inherit.len()
+            )));
+        }
         if !fds_to_inherit.is_empty() {
             unsafe {
                 command.pre_exec(move || {
+                    let n = fds_to_inherit.len();
+                    let mut safe_fds = [0i32; 8];
                     for (i, &fd) in fds_to_inherit.iter().enumerate() {
-                        let target_fd = (3 + i) as libc::c_int;
-                        if fd != target_fd {
-                            if libc::dup2(fd, target_fd) == -1 {
+                        if fd >= 3 && fd < 3 + n as i32 {
+                            let safe = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3 + n as i32);
+                            if safe == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            safe_fds[i] = safe;
+                        } else {
+                            safe_fds[i] = fd;
+                        }
+                    }
+                    for (i, &fd) in safe_fds.iter().enumerate().take(n) {
+                        let target = (3 + i) as libc::c_int;
+                        if fd != target {
+                            if libc::dup2(fd, target) == -1 {
                                 return Err(std::io::Error::last_os_error());
                             }
                             libc::close(fd);
                         }
-                        let flags = libc::fcntl(target_fd, libc::F_GETFD);
+                        let flags = libc::fcntl(target, libc::F_GETFD);
                         if flags != -1 {
-                            libc::fcntl(target_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                            libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                         }
                     }
                     Ok(())
