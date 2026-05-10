@@ -255,6 +255,19 @@ impl Sandbox for MicroVm {
                 })
                 .collect();
 
+            let filter_result = crate::env::filter_caller_env(&cfg.env);
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::EnvPolicy {
+                    timestamp: ctx.timestamp(),
+                    passed_keys: filter_result
+                        .passed
+                        .iter()
+                        .map(|(k, _)| k.clone())
+                        .collect(),
+                    dropped: filter_result.dropped,
+                })?;
+            }
+
             let mut process = launch_vm(
                 vm_cfg,
                 &overlay_path,
@@ -263,7 +276,7 @@ impl Sandbox for MicroVm {
                 &read_vols,
                 &write_vols,
                 &full_cmd,
-                &cfg.env,
+                &filter_result.passed,
                 net_fd,
                 net_ips.as_ref(),
                 &tmp_dir,
