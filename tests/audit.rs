@@ -437,3 +437,92 @@ fn mandatory_sink_abort() {
         "mandatory panicking sink should cause launch failure"
     );
 }
+
+#[test]
+fn env_enforcement_end_to_end() {
+    let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+    let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+    let mut cfg = basic_config(sink);
+
+    let env_file = std::env::temp_dir().join(format!("arapuca-env-test-{}", std::process::id()));
+
+    // Drop guard ensures cleanup even if assertions panic.
+    struct FileGuard<'a>(&'a std::path::Path);
+    impl Drop for FileGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _guard = FileGuard(&env_file);
+
+    let env_path = env_file.to_string_lossy().to_string();
+
+    cfg.env = vec![
+        ("SAFE_VAR".into(), "hello".into()),
+        ("LD_PRELOAD".into(), "/evil.so".into()),
+        ("PYTHONPATH".into(), "/inject".into()),
+    ];
+
+    let sb = new().unwrap();
+    let mut proc = sb
+        .launch(
+            &cfg,
+            "/bin/sh",
+            &["-c", &format!("/usr/bin/env > '{env_path}'")],
+        )
+        .unwrap();
+    let status = proc.wait().unwrap();
+    assert!(status.success());
+    proc.cleanup();
+
+    let env_output = std::fs::read_to_string(&env_file).unwrap();
+
+    assert!(
+        env_output.lines().any(|l| l.starts_with("SAFE_VAR=")),
+        "SAFE_VAR should be in child environment"
+    );
+    assert!(
+        !env_output.lines().any(|l| l.starts_with("LD_PRELOAD=")),
+        "LD_PRELOAD should be filtered from child environment"
+    );
+    assert!(
+        !env_output.lines().any(|l| l.starts_with("PYTHONPATH=")),
+        "PYTHONPATH should be filtered from child environment"
+    );
+}
+
+#[test]
+fn audit_sanitization_end_to_end() {
+    let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+    let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+    let mut cfg = basic_config(sink);
+    cfg.audit_verbosity = AuditVerbosity::Verbose;
+
+    // Pass args with bidi override and zero-width characters.
+    let bidi_arg = "normal\u{202E}evil\u{202C}text";
+    let zwsp_arg = "clean\u{200B}data";
+
+    let sb = new().unwrap();
+    let mut proc = sb.launch(&cfg, "/bin/true", &[bidi_arg, zwsp_arg]).unwrap();
+    proc.wait().unwrap();
+    proc.cleanup();
+
+    let events = vec_sink.0.lock().unwrap();
+    match &events[0] {
+        AuditEvent::SandboxInit { args, .. } => {
+            let args = args.as_ref().expect("Verbose mode should include args");
+            // Bidi overrides and zero-width chars should be stripped.
+            assert_ne!(
+                args[0], bidi_arg,
+                "unsanitized bidi string must not appear in audit"
+            );
+            assert_ne!(
+                args[1], zwsp_arg,
+                "unsanitized zero-width string must not appear in audit"
+            );
+            assert_eq!(args[0], "normaleviltext");
+            assert_eq!(args[1], "cleandata");
+        }
+        _ => panic!("first event should be SandboxInit"),
+    }
+}
