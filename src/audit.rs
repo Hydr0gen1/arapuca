@@ -268,6 +268,7 @@ pub enum DropReason {
     InterpreterInjection,
     ShellInjection,
     WindowsShimInjection,
+    RuntimeInjection,
 }
 
 /// An environment variable that was dropped during filtering.
@@ -547,8 +548,9 @@ mod tests {
             DropReason::InterpreterInjection,
             DropReason::ShellInjection,
             DropReason::WindowsShimInjection,
+            DropReason::RuntimeInjection,
         ];
-        assert_eq!(reasons.len(), 8);
+        assert_eq!(reasons.len(), 9);
     }
 
     #[test]

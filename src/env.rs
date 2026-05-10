@@ -98,6 +98,38 @@ fn drop_reason(key: &str) -> Option<DropReason> {
     if matches!(key, "COMSPEC" | "PSModulePath" | "PATHEXT") {
         return Some(DropReason::ShellInjection);
     }
+    if matches!(
+        key,
+        "RUBYOPT"
+            | "RUBYLIB"
+            | "JAVA_TOOL_OPTIONS"
+            | "_JAVA_OPTIONS"
+            | "CLASSPATH"
+            | "PYTHONHOME"
+            | "GOFLAGS"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_SYSTEM"
+            | "GIT_SSH_COMMAND"
+    ) {
+        return Some(DropReason::RuntimeInjection);
+    }
+    if matches!(
+        key,
+        "http_proxy"
+            | "HTTP_PROXY"
+            | "https_proxy"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "all_proxy"
+            | "NO_PROXY"
+            | "no_proxy"
+            | "CURL_CA_BUNDLE"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "REQUESTS_CA_BUNDLE"
+    ) {
+        return Some(DropReason::RuntimeInjection);
+    }
     None
 }
 
