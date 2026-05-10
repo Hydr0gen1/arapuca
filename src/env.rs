@@ -147,19 +147,13 @@ pub fn make_tmp_dir(task_id: &str) -> crate::Result<PathBuf> {
 ///
 /// Used to prevent tmpdir leaks on early error returns between
 /// `make_tmp_dir()` and successful `Process` construction.
-#[cfg(any(
-    target_os = "linux",
-    not(any(target_os = "macos", target_os = "windows"))
-))]
+#[cfg(unix)]
 pub(crate) struct TmpDirGuard {
     path: std::path::PathBuf,
     active: bool,
 }
 
-#[cfg(any(
-    target_os = "linux",
-    not(any(target_os = "macos", target_os = "windows"))
-))]
+#[cfg(unix)]
 impl TmpDirGuard {
     pub fn new(path: std::path::PathBuf) -> Self {
         Self { path, active: true }
@@ -175,10 +169,7 @@ impl TmpDirGuard {
     }
 }
 
-#[cfg(any(
-    target_os = "linux",
-    not(any(target_os = "macos", target_os = "windows"))
-))]
+#[cfg(unix)]
 impl Drop for TmpDirGuard {
     fn drop(&mut self) {
         if self.active {
@@ -631,5 +622,29 @@ mod tests {
         assert_eq!(map.get("ARAPUCA_RLIMIT_FSIZE"), Some(&fsize_bytes.as_str()));
         assert_eq!(map.get("ARAPUCA_READ_PATHS"), Some(&"/usr"));
         assert!(!map.contains_key("ARAPUCA_RLIMIT_NPROC"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmpdir_guard_cleans_up_on_drop() {
+        let dir = make_tmp_dir("guard-drop-test").unwrap();
+        assert!(dir.exists());
+        {
+            let _guard = TmpDirGuard::new(dir.clone());
+        }
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmpdir_guard_defuse_preserves_dir() {
+        let dir = make_tmp_dir("guard-defuse-test").unwrap();
+        assert!(dir.exists());
+        let path = {
+            let guard = TmpDirGuard::new(dir.clone());
+            guard.defuse()
+        };
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -149,13 +149,14 @@ impl Sandbox for Darwin {
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
-        let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
-
-        // Canonicalize tmp_dir for Seatbelt profile paths. On macOS,
-        // /var -> /private/var and /tmp -> /private/tmp. Seatbelt
-        // resolves symlinks in access paths but stores profile paths
-        // as-is, so un-canonicalized paths cause silent denials.
-        let tmp_dir = std::fs::canonicalize(&tmp_dir).unwrap_or(tmp_dir);
+        // Create tmpdir and canonicalize for Seatbelt profile paths.
+        // On macOS, /tmp -> /private/tmp. TmpDirGuard holds the canonical
+        // path so that guard cleanup, Seatbelt profiles, and Process.tmp_dir
+        // all use the same resolved path.
+        let raw_tmp = crate::env::make_tmp_dir(&cfg.task_id)?;
+        let canonical_tmp = std::fs::canonicalize(&raw_tmp).unwrap_or(raw_tmp);
+        let tmp_guard = crate::env::TmpDirGuard::new(canonical_tmp);
+        let tmp_dir = tmp_guard.path().to_path_buf();
 
         // Helper: canonicalize a path for Seatbelt profile embedding.
         // Falls back to the original if canonicalization fails (path
@@ -316,10 +317,9 @@ impl Sandbox for Darwin {
             });
         }
 
-        let child = command.spawn().map_err(|e| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            Error::Process(format!("start sandboxed process: {e}"))
-        })?;
+        let child = command
+            .spawn()
+            .map_err(|e| Error::Process(format!("start sandboxed process: {e}")))?;
 
         let pid = child.id();
 
@@ -331,7 +331,7 @@ impl Sandbox for Darwin {
 
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
-            tmp_dir,
+            tmp_dir: tmp_guard.defuse(),
             audit_ctx: None,
             final_stats: None,
         })
