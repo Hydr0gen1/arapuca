@@ -218,6 +218,7 @@ pub enum SandboxLayer {
     IntegrityLevel,
     MitigationPolicy,
     DaclGrant,
+    ProcessSpawn,
 }
 
 /// Structured detail for a successfully applied layer.

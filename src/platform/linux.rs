@@ -584,7 +584,7 @@ impl Sandbox for Linux {
             if let Some(ref ctx) = audit_ctx {
                 let _ = ctx.emit(AuditEvent::LayerFailed {
                     timestamp: ctx.timestamp(),
-                    layer: SandboxLayer::Setsid,
+                    layer: SandboxLayer::ProcessSpawn,
                     error: sanitize_audit_string(&format!("spawn failed: {e}")),
                 });
             }
