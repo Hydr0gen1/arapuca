@@ -547,7 +547,9 @@ impl Sandbox for Linux {
                             ctx.emit(AuditEvent::LayerSkipped {
                                 timestamp: ctx.timestamp(),
                                 layer: SandboxLayer::Cgroup,
-                                reason: SkipReason::PartialFailure(format!("{e}")),
+                                reason: SkipReason::PartialFailure(sanitize_audit_string(
+                                    &format!("{e}"),
+                                )),
                             })?;
                         }
                         skipped_layers.push(SandboxLayer::Cgroup);
@@ -637,7 +639,9 @@ impl Sandbox for Linux {
                     if let Err(ae) = ctx.emit(AuditEvent::LayerSkipped {
                         timestamp: ctx.timestamp(),
                         layer: SandboxLayer::Cgroup,
-                        reason: SkipReason::PartialFailure(format!("add_pid failed: {e}")),
+                        reason: SkipReason::PartialFailure(sanitize_audit_string(&format!(
+                            "add_pid failed: {e}"
+                        ))),
                     }) {
                         log::error!("audit emit failed: {ae}");
                     }
@@ -729,7 +733,10 @@ fn validate_wrapper_audit(read_fd: RawFd) {
 
     for line in &lines {
         if line.contains(r#""status":"failed""#) {
-            log::error!("wrapper audit: layer failure reported: {line}");
+            log::error!(
+                "wrapper audit: layer failure reported: {}",
+                sanitize_audit_string(line)
+            );
         }
     }
 }
