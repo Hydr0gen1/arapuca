@@ -713,7 +713,14 @@ fn vm_start(args: &[String]) {
     let vm_name = name.unwrap_or_else(|| {
         let mut buf = [0u8; 8];
         // SAFETY: getrandom with valid buffer and no flags.
-        unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let ret = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if ret != buf.len() as isize {
+            eprintln!(
+                "arapuca: getrandom failed for VM name: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(1);
+        }
         format!(
             "vm-{}",
             buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
