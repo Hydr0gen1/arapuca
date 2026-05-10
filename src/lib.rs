@@ -42,7 +42,8 @@ pub use profile::{
     Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
 };
 pub use validate::{
-    reject_cgroup_paths, sanitize_task_id, validate_guest_path, validate_guest_permissions,
+    MAX_GUEST_FILE_SIZE, MAX_GUEST_WRITE_FILES, reject_cgroup_paths, sanitize_task_id,
+    validate_guest_file_content, validate_guest_path, validate_guest_permissions,
 };
 
 /// Result type for arapuca operations.

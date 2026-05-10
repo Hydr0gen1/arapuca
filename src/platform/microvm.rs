@@ -71,6 +71,27 @@ impl Sandbox for MicroVm {
 
         crate::sanitize_task_id(&cfg.task_id)?;
 
+        // Pre-fork validation of write_files: validate before cloud-init
+        // YAML generation to catch errors early with proper messages.
+        // Post-fork validation in exec_vm_inner provides defense-in-depth.
+        if vm_cfg.write_files.len() > crate::MAX_GUEST_WRITE_FILES {
+            return Err(Error::MicroVm(format!(
+                "too many write_files ({}, max {})",
+                vm_cfg.write_files.len(),
+                crate::MAX_GUEST_WRITE_FILES
+            )));
+        }
+        for gf in &vm_cfg.write_files {
+            crate::validate_guest_path(&gf.path)
+                .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
+            if let Some(perms) = &gf.permissions {
+                crate::validate_guest_permissions(perms)
+                    .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
+            }
+            crate::validate_guest_file_content(&gf.content)
+                .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
+        }
+
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
         // Wrap the rest so tmp_dir is cleaned up on error.
@@ -722,6 +743,8 @@ fn exec_vm_inner(
     );
 
     // Write guest files from the write_files configuration.
+    // Defense-in-depth: re-validate here in the post-fork child in case
+    // a future code path bypasses the pre-fork validation in launch().
     for gf in write_files {
         crate::validate_guest_path(&gf.path)
             .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
@@ -729,6 +752,8 @@ fn exec_vm_inner(
             crate::validate_guest_permissions(perms)
                 .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
         }
+        crate::validate_guest_file_content(&gf.content)
+            .map_err(|e| Error::MicroVm(format!("write_files: {e}")))?;
         let qpath = shell_quote(&gf.path);
         if let Some(parent) = std::path::Path::new(&gf.path).parent() {
             if parent != std::path::Path::new("/") {

@@ -3,6 +3,15 @@ use crate::Error;
 /// Maximum length for a task ID.
 const MAX_TASK_ID_LEN: usize = 128;
 
+/// Maximum size (bytes) for a single guest file's content.
+pub const MAX_GUEST_FILE_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of write_files entries.
+pub const MAX_GUEST_WRITE_FILES: usize = 16;
+
+/// Guest paths that must not be written to via write_files.
+const GUEST_PATH_DENY_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/cidata", "/agent"];
+
 /// Validate and sanitize a task ID.
 ///
 /// Task IDs are used in filesystem paths (cgroup directories, temp dirs),
@@ -28,7 +37,7 @@ pub fn sanitize_task_id(id: &str) -> crate::Result<&str> {
     Ok(id)
 }
 
-/// Validate a guest file path (must be absolute, no `..` components).
+/// Validate a guest file path (must be absolute, no `..`, not in denied prefixes).
 pub fn validate_guest_path(path: &str) -> crate::Result<()> {
     if !path.starts_with('/') {
         return Err(Error::Validation("guest path must be absolute".into()));
@@ -36,6 +45,29 @@ pub fn validate_guest_path(path: &str) -> crate::Result<()> {
     if path.split('/').any(|c| c == "..") {
         return Err(Error::Validation(format!(
             "guest path contains '..': {path}"
+        )));
+    }
+    let normalized = normalize_path(std::path::Path::new(path));
+    let ns = normalized.to_string_lossy();
+    if ns == "/" {
+        return Err(Error::Validation("guest path must not be '/'".into()));
+    }
+    for prefix in GUEST_PATH_DENY_PREFIXES {
+        if ns == *prefix || ns.starts_with(&format!("{prefix}/")) {
+            return Err(Error::Validation(format!(
+                "guest path in denied prefix: {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate guest file content size (must not exceed MAX_GUEST_FILE_SIZE).
+pub fn validate_guest_file_content(content: &str) -> crate::Result<()> {
+    if content.len() > MAX_GUEST_FILE_SIZE {
+        return Err(Error::Validation(format!(
+            "guest file content too large ({} bytes, max {MAX_GUEST_FILE_SIZE})",
+            content.len()
         )));
     }
     Ok(())
@@ -254,5 +286,72 @@ mod tests {
             normalize_path(&PathBuf::from("/a/./b")),
             PathBuf::from("/a/b")
         );
+    }
+
+    #[test]
+    fn guest_path_sensitive_prefixes_rejected() {
+        assert!(validate_guest_path("/proc/self").is_err());
+        assert!(validate_guest_path("/sys/kernel").is_err());
+        assert!(validate_guest_path("/dev/null").is_err());
+        assert!(validate_guest_path("/cidata/init.sh").is_err());
+        assert!(validate_guest_path("/agent/bin").is_err());
+    }
+
+    #[test]
+    fn guest_path_bare_prefix_rejected() {
+        assert!(validate_guest_path("/proc").is_err());
+        assert!(validate_guest_path("/sys").is_err());
+        assert!(validate_guest_path("/dev").is_err());
+        assert!(validate_guest_path("/cidata").is_err());
+        assert!(validate_guest_path("/agent").is_err());
+    }
+
+    #[test]
+    fn guest_path_root_rejected() {
+        assert!(validate_guest_path("/").is_err());
+    }
+
+    #[test]
+    fn guest_path_etc_allowed() {
+        assert!(validate_guest_path("/etc/hostname").is_ok());
+    }
+
+    #[test]
+    fn guest_path_similar_prefix_allowed() {
+        assert!(validate_guest_path("/process_data").is_ok());
+        assert!(validate_guest_path("/system/config").is_ok());
+        assert!(validate_guest_path("/devices/usb").is_ok());
+    }
+
+    #[test]
+    fn guest_path_dot_component_rejected() {
+        assert!(validate_guest_path("/proc/./self").is_err());
+    }
+
+    #[test]
+    fn guest_path_double_slash_rejected() {
+        assert!(validate_guest_path("//proc/self").is_err());
+    }
+
+    #[test]
+    fn guest_path_trailing_slash_rejected() {
+        assert!(validate_guest_path("/proc/").is_err());
+    }
+
+    #[test]
+    fn guest_file_content_empty_ok() {
+        assert!(validate_guest_file_content("").is_ok());
+    }
+
+    #[test]
+    fn guest_file_content_at_limit_ok() {
+        let content = "a".repeat(MAX_GUEST_FILE_SIZE);
+        assert!(validate_guest_file_content(&content).is_ok());
+    }
+
+    #[test]
+    fn guest_file_content_one_over_rejected() {
+        let content = "a".repeat(MAX_GUEST_FILE_SIZE + 1);
+        assert!(validate_guest_file_content(&content).is_err());
     }
 }
