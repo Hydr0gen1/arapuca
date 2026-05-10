@@ -21,7 +21,7 @@ pub struct Other;
 
 impl Sandbox for Other {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
-        let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
+        let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 
         let audit_ctx = cfg
             .audit_sink
@@ -92,7 +92,7 @@ impl Sandbox for Other {
             command.current_dir(work_dir);
         }
 
-        let mut env_vars = crate::env::minimal_env(&tmp_dir);
+        let mut env_vars = crate::env::minimal_env(tmp_guard.path());
         let filter_result = crate::env::filter_caller_env(&cfg.env);
         env_vars.extend(filter_result.passed);
 
@@ -171,10 +171,9 @@ impl Sandbox for Other {
             }
         }
 
-        let child = command.spawn().map_err(|e| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            Error::Process(format!("start process: {e}"))
-        })?;
+        let child = command
+            .spawn()
+            .map_err(|e| Error::Process(format!("start process: {e}")))?;
 
         if let Some(ref ctx) = audit_ctx {
             if let Err(e) = ctx.emit(AuditEvent::ProcessStarted {
@@ -187,7 +186,7 @@ impl Sandbox for Other {
 
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
-            tmp_dir,
+            tmp_dir: tmp_guard.defuse(),
             audit_ctx,
             final_stats: None,
         })

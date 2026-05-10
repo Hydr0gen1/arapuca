@@ -143,6 +143,50 @@ pub fn make_tmp_dir(task_id: &str) -> crate::Result<PathBuf> {
     Ok(dir)
 }
 
+/// RAII guard that removes a temporary directory on drop unless defused.
+///
+/// Used to prevent tmpdir leaks on early error returns between
+/// `make_tmp_dir()` and successful `Process` construction.
+#[cfg(any(
+    target_os = "linux",
+    not(any(target_os = "macos", target_os = "windows"))
+))]
+pub(crate) struct TmpDirGuard {
+    path: std::path::PathBuf,
+    active: bool,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    not(any(target_os = "macos", target_os = "windows"))
+))]
+impl TmpDirGuard {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path, active: true }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn defuse(mut self) -> std::path::PathBuf {
+        self.active = false;
+        std::mem::take(&mut self.path)
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    not(any(target_os = "macos", target_os = "windows"))
+))]
+impl Drop for TmpDirGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// Create a socket directory for JSON-RPC communication.
 ///
 /// Creates a directory with mode 0700 and a random suffix for the

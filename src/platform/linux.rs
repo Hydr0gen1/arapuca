@@ -54,7 +54,7 @@ impl Sandbox for Linux {
         crate::reject_cgroup_paths(&cfg.profile.read_paths)?;
         crate::reject_cgroup_paths(&cfg.profile.write_paths)?;
 
-        let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
+        let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 
         let audit_ctx = cfg
             .audit_sink
@@ -160,7 +160,6 @@ impl Sandbox for Linux {
             let has_paths =
                 !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
             if wrapper.is_none() && has_paths {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(Error::Process(
                     "filesystem restrictions requested but arapuca wrapper binary \
                      not found — refusing to launch without Landlock/seccomp enforcement"
@@ -241,13 +240,13 @@ impl Sandbox for Linux {
         }
 
         // Build minimal environment.
-        let mut env_vars = crate::env::minimal_env(&tmp_dir);
+        let mut env_vars = crate::env::minimal_env(tmp_guard.path());
 
         // Add Landlock/rlimit env vars for the wrapper.
         if use_landlock {
             let mut profile = cfg.profile.clone();
-            profile.write_paths.push(tmp_dir.clone());
-            profile.read_paths.push(tmp_dir.clone());
+            profile.write_paths.push(tmp_guard.path().to_path_buf());
+            profile.read_paths.push(tmp_guard.path().to_path_buf());
             env_vars.extend(crate::env::wrapper_env(&profile));
         }
 
@@ -604,7 +603,6 @@ impl Sandbox for Linux {
                     let _ = mgr.destroy(path);
                 }
             }
-            let _ = std::fs::remove_dir_all(&tmp_dir);
             Error::Process(format!("start sandboxed process: {e}"))
         })?;
 
@@ -649,7 +647,7 @@ impl Sandbox for Linux {
 
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
-            tmp_dir,
+            tmp_dir: tmp_guard.defuse(),
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
             #[cfg(feature = "microvm")]
