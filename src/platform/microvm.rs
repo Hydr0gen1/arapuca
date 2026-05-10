@@ -456,7 +456,12 @@ pub(crate) fn exec_vm(
         net_ips,
         persistent,
     ) {
-        eprintln!("arapuca: microvm: {e}");
+        // Post-fork: use raw write(2) to avoid mutex/allocation deadlocks.
+        // We lose the dynamic error message but avoid the risk of hanging
+        // the child if the parent held the stderr lock at fork time.
+        let _ = e;
+        let msg = b"arapuca: microvm: exec_vm failed\n";
+        unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
     }
     // SAFETY: we are in the forked child.
     unsafe { libc::_exit(1) }
