@@ -232,6 +232,7 @@ pub enum LayerDetail {
     },
     Cgroup {
         path: String,
+        swap_disabled: bool,
     },
     ProxyBridge {
         port: u16,

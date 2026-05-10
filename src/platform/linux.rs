@@ -525,18 +525,22 @@ impl Sandbox for Linux {
         if let Some(ref mgr) = self.cgroup_mgr {
             if limits.has_limits() {
                 match mgr.create(&cfg.task_id, &limits) {
-                    Ok(path) => {
+                    Ok(result) => {
+                        if !result.swap_disabled {
+                            log::warn!("cgroup: memory.swap.max could not be set");
+                        }
                         if let Some(ref ctx) = audit_ctx {
                             ctx.emit(AuditEvent::LayerApplied {
                                 timestamp: ctx.timestamp(),
                                 layer: SandboxLayer::Cgroup,
                                 detail: Some(LayerDetail::Cgroup {
-                                    path: sanitize_audit_string(&path.to_string_lossy()),
+                                    path: sanitize_audit_string(&result.path.to_string_lossy()),
+                                    swap_disabled: result.swap_disabled,
                                 }),
                             })?;
                         }
                         applied_layers.push(SandboxLayer::Cgroup);
-                        cgroup_path = Some(path);
+                        cgroup_path = Some(result.path);
                     }
                     Err(e) => {
                         log::warn!("cgroup creation failed: {e} (continuing without)");

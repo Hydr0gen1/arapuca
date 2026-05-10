@@ -21,6 +21,13 @@ const DESTROY_RETRIES: u32 = 3;
 const DESTROY_BACKOFF: Duration = Duration::from_millis(100);
 const CPU_PERIOD: i64 = 100_000; // microseconds
 
+/// Result of creating a cgroup directory.
+#[derive(Debug)]
+pub struct CgroupCreateResult {
+    pub path: PathBuf,
+    pub swap_disabled: bool,
+}
+
 /// Resource limits for a cgroup.
 #[derive(Debug, Clone, Default)]
 pub struct CgroupLimits {
@@ -107,9 +114,13 @@ impl CgroupManager {
 
     /// Create a cgroup for the given task with the specified limits.
     ///
-    /// Returns the cgroup directory path. On failure, any partially
-    /// created directory is cleaned up.
-    pub fn create(&self, task_id: &str, limits: &CgroupLimits) -> crate::Result<PathBuf> {
+    /// Returns the cgroup directory path and whether swap was disabled.
+    /// On failure, any partially created directory is cleaned up.
+    pub fn create(
+        &self,
+        task_id: &str,
+        limits: &CgroupLimits,
+    ) -> crate::Result<CgroupCreateResult> {
         let clean_id = crate::sanitize_task_id(task_id)?;
         limits.validate()?;
 
@@ -118,12 +129,16 @@ impl CgroupManager {
         fs::create_dir(&cg_path)
             .map_err(|e| Error::Cgroup(format!("mkdir {}: {e}", cg_path.display())))?;
 
-        if let Err(e) = self.write_controller_files(&cg_path, limits) {
-            let _ = fs::remove_dir(&cg_path);
-            return Err(e);
+        match self.write_controller_files(&cg_path, limits) {
+            Ok(swap_disabled) => Ok(CgroupCreateResult {
+                path: cg_path,
+                swap_disabled,
+            }),
+            Err(e) => {
+                let _ = fs::remove_dir(&cg_path);
+                Err(e)
+            }
         }
-
-        Ok(cg_path)
     }
 
     /// Write a PID to the cgroup's cgroup.procs file.
@@ -224,7 +239,10 @@ impl CgroupManager {
         usage
     }
 
-    fn write_controller_files(&self, cg_path: &Path, limits: &CgroupLimits) -> crate::Result<()> {
+    /// Returns `Ok(true)` if all writes succeeded (swap disabled),
+    /// `Ok(false)` if swap.max write failed (memory limits still applied).
+    fn write_controller_files(&self, cg_path: &Path, limits: &CgroupLimits) -> crate::Result<bool> {
+        let mut swap_disabled = true;
         if limits.memory_max_mb > 0 {
             if self.has_controller("memory") {
                 let mem_max = limits.memory_max_mb as i64 * 1024 * 1024;
@@ -232,9 +250,9 @@ impl CgroupManager {
                 // memory.high at 90% for throttling before hard OOM.
                 let mem_high = mem_max * 9 / 10;
                 write_cgroup_file(cg_path, "memory.high", &mem_high.to_string())?;
-                // Disable swap.
                 if let Err(e) = write_cgroup_file(cg_path, "memory.swap.max", "0") {
                     log::warn!("cgroup: memory.swap.max: {e} (continuing)");
+                    swap_disabled = false;
                 }
             } else {
                 return Err(Error::CgroupDegraded(
@@ -263,7 +281,7 @@ impl CgroupManager {
             }
         }
 
-        Ok(())
+        Ok(swap_disabled)
     }
 
     /// Clean up leftover cgroup directories from previous sessions.
