@@ -341,11 +341,29 @@ fn launch_vm(
         // ── VM child ──────────────────────────────────────────
         // Apply process-sandbox invariants: setsid, pdeathsig,
         // NO_NEW_PRIVS, and FD sanitization.
-        // SAFETY: all calls are async-signal-safe.
+        // SAFETY: all calls are async-signal-safe. Error reporting
+        // uses raw write(2) to avoid mutex/allocation in eprintln!.
         unsafe {
-            libc::setsid();
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            if libc::setsid() == -1 {
+                let msg = b"arapuca: microvm: setsid failed\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                let msg = b"arapuca: microvm: prctl PDEATHSIG failed\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                let msg = b"arapuca: microvm: prctl NO_NEW_PRIVS failed\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
+            }
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+                let msg = b"arapuca: microvm: prctl DUMPABLE failed\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
+            }
 
             // Close all FDs except stdin/stdout/stderr and the
             // passt parent_fd (if networking is enabled).

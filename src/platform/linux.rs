@@ -387,10 +387,15 @@ impl Sandbox for Linux {
         // calls (setsid, prctl, dup2, fcntl) — no std::fs or allocation.
         unsafe {
             command.pre_exec(move || {
-                // Setsid: detach from host's terminal session.
-                libc::setsid();
-                // Pdeathsig: kill subprocess if parent dies.
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
 
                 // Map extra FDs to deterministic positions (3, 4, ...).
                 // The Go orchestrator expects the nonce pipe at FD 3.
