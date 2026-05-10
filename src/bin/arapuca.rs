@@ -190,7 +190,12 @@ fn main() {
 
     let c_args: Vec<CString> = cmd_args
         .iter()
-        .filter_map(|a| CString::new(a.as_str()).ok())
+        .map(|a| {
+            CString::new(a.as_str()).unwrap_or_else(|_| {
+                eprintln!("arapuca: invalid argument (contains null byte): {a}");
+                std::process::exit(1);
+            })
+        })
         .collect();
 
     // Exec the target command (Unix: replaces process, Windows: spawn-and-wait).
@@ -211,7 +216,15 @@ fn main() {
                     // Leak a "key=value" CString for the envp array.
                     // This is fine because execve replaces the process.
                     let kv = format!("{}={}", k.to_string_lossy(), v.to_string_lossy());
-                    CString::new(kv).unwrap().into_raw() as *const libc::c_char
+                    CString::new(kv)
+                        .unwrap_or_else(|_| {
+                            eprintln!(
+                                "arapuca: invalid env var (contains null byte): key={}",
+                                k.to_string_lossy()
+                            );
+                            std::process::exit(1);
+                        })
+                        .into_raw() as *const libc::c_char
                 })
                 .chain(std::iter::once(std::ptr::null()))
                 .collect();
