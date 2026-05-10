@@ -405,7 +405,11 @@ pub(crate) fn sanitize_audit_string(s: &str) -> String {
             }
             !matches!(
                 *c,
-                '\u{202A}'..='\u{202E}'
+                '\u{200B}'..='\u{200D}'
+                    | '\u{2028}'..='\u{2029}'
+                    | '\u{2060}'
+                    | '\u{FEFF}'
+                    | '\u{202A}'..='\u{202E}'
                     | '\u{2066}'..='\u{2069}'
                     | '\u{200E}'
                     | '\u{200F}'
@@ -527,6 +531,25 @@ mod tests {
     #[test]
     fn sanitize_preserves_normal_unicode() {
         assert_eq!(sanitize_audit_string("café ñ 日本語"), "café ñ 日本語");
+    }
+
+    #[test]
+    fn sanitize_strips_zero_width_chars() {
+        assert_eq!(sanitize_audit_string("a\u{200B}b"), "ab");
+        assert_eq!(sanitize_audit_string("a\u{200C}b"), "ab");
+        assert_eq!(sanitize_audit_string("a\u{200D}b"), "ab");
+        assert_eq!(sanitize_audit_string("a\u{2060}b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_strips_bom() {
+        assert_eq!(sanitize_audit_string("\u{FEFF}hello"), "hello");
+    }
+
+    #[test]
+    fn sanitize_strips_line_separators() {
+        assert_eq!(sanitize_audit_string("a\u{2028}b"), "ab");
+        assert_eq!(sanitize_audit_string("a\u{2029}b"), "ab");
     }
 
     #[test]
