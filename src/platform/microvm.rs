@@ -368,10 +368,13 @@ fn launch_vm(
             // Close all FDs except stdin/stdout/stderr and the
             // passt parent_fd (if networking is enabled).
             let keep_fd = net_fd.unwrap_or(-1);
-            for fd in 3..1024 {
-                if fd != keep_fd {
-                    libc::close(fd);
+            if keep_fd >= 3 {
+                if keep_fd > 3 {
+                    libc::syscall(libc::SYS_close_range, 3u32, (keep_fd - 1) as u32, 0u32);
                 }
+                libc::syscall(libc::SYS_close_range, (keep_fd + 1) as u32, u32::MAX, 0u32);
+            } else {
+                libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
             }
         }
 

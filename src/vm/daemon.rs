@@ -146,14 +146,22 @@ pub fn daemonize(log_path: &Path, keep_fds: &[RawFd]) -> io::Result<DaemonResult
     // SAFETY: prctl with simple integer args.
     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
 
-    // Close all FDs except stdin/stdout/stderr and keep_fds.
-    // SAFETY: close on valid fd range.
+    // Close all FDs >= 3 except keep_fds, using close_range (Linux 5.9+).
+    // SAFETY: close_range with valid fd ranges.
     unsafe {
-        for fd in 3..1024 {
-            if !keep_fds.contains(&fd) {
-                libc::close(fd);
+        let mut sorted: Vec<i32> = keep_fds.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let mut start = 3i32;
+        for &fd in &sorted {
+            if fd >= start {
+                if fd > start {
+                    libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
+                }
+                start = fd + 1;
             }
         }
+        libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
     }
 
     Ok(DaemonResult::Daemon)

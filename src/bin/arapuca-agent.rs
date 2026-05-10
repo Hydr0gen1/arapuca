@@ -566,9 +566,7 @@ unsafe fn exec_child(
         // load-bearing for pipe mode.
         libc::setpgid(0, 0);
 
-        for fd in 3..1024 {
-            libc::close(fd);
-        }
+        libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
 
         if let Some(info) = user_info {
             if libc::setgroups(info.ngroups as libc::size_t, info.groups.as_ptr()) != 0 {
