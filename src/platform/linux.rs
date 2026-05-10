@@ -322,30 +322,8 @@ impl Sandbox for Linux {
         super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        let mut fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
-
-        // Validate extra FDs before creating any resources that would
-        // need cleanup on error.
-        for &fd in &fds_to_inherit {
-            if fd < 3 {
-                return Err(Error::Validation(format!(
-                    "extra FD must be >= 3, got {fd}"
-                )));
-            }
-        }
-        {
-            let mut sorted = fds_to_inherit.clone();
-            sorted.sort();
-            if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
-                return Err(Error::Validation(format!("duplicate extra FD: {}", dup[0])));
-            }
-        }
-        if fds_to_inherit.len() > 7 {
-            return Err(Error::Validation(format!(
-                "too many extra FDs ({}, max 7)",
-                fds_to_inherit.len()
-            )));
-        }
+        super::fd::validate_extra_fds(&cfg.extra_fds, cfg)?;
+        let mut fds_to_inherit = std::mem::ManuallyDrop::new(cfg.extra_fds.clone());
 
         // ── Audit pipe for wrapper binary verification ─────────────
         // When auditing is active and the wrapper binary is used, create
@@ -409,7 +387,8 @@ impl Sandbox for Linux {
 
         // SAFETY: pre_exec runs between fork and exec. Only
         // async-signal-safe functions are permitted. We use raw libc
-        // calls (setsid, prctl, dup2, fcntl) — no std::fs or allocation.
+        // calls (setsid, prctl) and fd::remap_fds (fcntl, dup2, close).
+        // ManuallyDrop prevents free() on the Vec in the child process.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -422,38 +401,8 @@ impl Sandbox for Linux {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // Map extra FDs to deterministic positions (3, 4, ...).
-                // The Go orchestrator expects the nonce pipe at FD 3.
-                //
-                // Two-pass approach to handle overlapping source/target
-                // FDs: first move any source FD that falls inside the
-                // target range [3, 3+N) to a safe position above it,
-                // then map from safe positions to targets.
-                let n = fds_to_inherit.len();
-                let mut safe_fds = [0i32; 8];
-                for (i, &fd) in fds_to_inherit.iter().enumerate() {
-                    if fd >= 3 && fd < 3 + n as i32 {
-                        let safe = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3 + n as i32);
-                        if safe == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        safe_fds[i] = safe;
-                    } else {
-                        safe_fds[i] = fd;
-                    }
-                }
-                for (i, &fd) in safe_fds.iter().enumerate().take(n) {
-                    let target = (3 + i) as libc::c_int;
-                    if fd != target {
-                        if libc::dup2(fd, target) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        libc::close(fd);
-                    }
-                    let flags = libc::fcntl(target, libc::F_GETFD);
-                    if flags != -1 {
-                        libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                    }
+                if !fds_to_inherit.is_empty() {
+                    super::fd::remap_fds(&mut fds_to_inherit)?;
                 }
 
                 Ok(())
