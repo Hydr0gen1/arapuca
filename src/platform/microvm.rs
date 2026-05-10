@@ -504,7 +504,8 @@ fn exec_vm_inner(
     // Add the overlay disk.
     let disk_path = CString::new(overlay_path.as_os_str().as_bytes())
         .map_err(|_| Error::MicroVm("invalid disk path".into()))?;
-    let disk_label = CString::new("root").unwrap();
+    let disk_label =
+        CString::new("root").map_err(|_| Error::MicroVm("CString: disk label".into()))?;
 
     let ret = unsafe {
         krun_sys::krun_add_disk2(
@@ -544,7 +545,8 @@ fn exec_vm_inner(
     }
 
     // Add cloud-init datasource as a virtio-fs share.
-    let ci_tag = CString::new("cidata").unwrap();
+    let ci_tag =
+        CString::new("cidata").map_err(|_| Error::MicroVm("CString: cidata tag".into()))?;
     let ci_path = CString::new(ci_dir.as_os_str().as_bytes())
         .map_err(|_| Error::MicroVm("invalid cloud-init path".into()))?;
 
@@ -555,7 +557,8 @@ fn exec_vm_inner(
 
     // Add read-only paths as virtio-fs shares (host paths).
     for (i, vol) in read_vols.iter().enumerate() {
-        let tag = CString::new(format!("ro{i}")).unwrap();
+        let tag =
+            CString::new(format!("ro{i}")).map_err(|_| Error::MicroVm("CString: ro tag".into()))?;
         let host = CString::new(vol.host.as_os_str().as_bytes())
             .map_err(|_| Error::MicroVm(format!("invalid read path: {}", vol.host.display())))?;
         let ret = unsafe { krun_sys::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()) };
@@ -566,7 +569,8 @@ fn exec_vm_inner(
 
     // Add read-write paths as virtio-fs shares (host paths).
     for (i, vol) in write_vols.iter().enumerate() {
-        let tag = CString::new(format!("rw{i}")).unwrap();
+        let tag =
+            CString::new(format!("rw{i}")).map_err(|_| Error::MicroVm("CString: rw tag".into()))?;
         let host = CString::new(vol.host.as_os_str().as_bytes())
             .map_err(|_| Error::MicroVm(format!("invalid write path: {}", vol.host.display())))?;
         let ret = unsafe { krun_sys::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()) };
@@ -598,7 +602,8 @@ fn exec_vm_inner(
         use std::os::unix::ffi::OsStrExt as _;
 
         // Read-only virtiofs share for the agent binary.
-        let agent_tag = CString::new("agent-bin").unwrap();
+        let agent_tag = CString::new("agent-bin")
+            .map_err(|_| Error::MicroVm("CString: agent-bin tag".into()))?;
         let agent_path = CString::new(opts.agent_bin_dir.as_os_str().as_bytes())
             .map_err(|_| Error::MicroVm("invalid agent bin path".into()))?;
         let ret =
@@ -749,19 +754,20 @@ fn exec_vm_inner(
     // Use a short ASCII-only bootstrap to mount cidata and exec the
     // init script. libkrun passes argv/env through the kernel command
     // line which only supports ASCII — the real script lives on disk.
-    let c_cmd = CString::new("/bin/sh").unwrap();
-    let c_arg_flag = CString::new("-c").unwrap();
+    let c_cmd = CString::new("/bin/sh").map_err(|_| Error::MicroVm("CString: /bin/sh".into()))?;
+    let c_arg_flag = CString::new("-c").map_err(|_| Error::MicroVm("CString: -c".into()))?;
     let c_arg_bootstrap = CString::new(
         "mkdir -p /cidata && mount -t virtiofs cidata /cidata && exec /bin/sh /cidata/init.sh",
     )
-    .unwrap();
+    .map_err(|_| Error::MicroVm("CString: bootstrap cmd".into()))?;
 
     let mut c_env: Vec<CString> = Vec::new();
-    c_env.push(CString::new("HOME=/root").unwrap());
+    c_env.push(CString::new("HOME=/root").map_err(|_| Error::MicroVm("CString: HOME".into()))?);
     c_env.push(
-        CString::new("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin").unwrap(),
+        CString::new("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")
+            .map_err(|_| Error::MicroVm("CString: PATH".into()))?,
     );
-    c_env.push(CString::new("TERM=xterm").unwrap());
+    c_env.push(CString::new("TERM=xterm").map_err(|_| Error::MicroVm("CString: TERM".into()))?);
     for (k, v) in env {
         if let Ok(kv) = CString::new(format!("{k}={v}")) {
             c_env.push(kv);
