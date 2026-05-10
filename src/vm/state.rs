@@ -534,13 +534,35 @@ pub fn prune_stale() -> io::Result<Vec<String>> {
 
 /// Verify /proc/<pid>/comm is "passt" before killing.
 fn kill_passt_if_valid(pid: u32) {
+    // Open pidfd first to pin the process, then verify /proc/comm.
+    // This eliminates the PID recycling race: once pidfd is open,
+    // the PID cannot be recycled until the fd is closed.
+    // SAFETY: pidfd_open with valid pid.
+    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+    if ret < 0 {
+        return;
+    }
+    let pidfd = ret as libc::c_int;
+
     let comm_path = format!("/proc/{pid}/comm");
-    if let Ok(comm) = fs::read_to_string(&comm_path) {
-        if comm.trim() == "passt" {
-            // SAFETY: pid verified as passt process via /proc/comm.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let is_passt = fs::read_to_string(&comm_path)
+        .map(|c| c.trim() == "passt")
+        .unwrap_or(false);
+
+    if is_passt {
+        // SAFETY: pidfd_send_signal with valid pidfd.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            );
         }
     }
+    // SAFETY: pidfd is a valid open fd.
+    unsafe { libc::close(pidfd) };
 }
 
 // ─── JSON helpers ─────────────────────────────────────────────

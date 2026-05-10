@@ -988,22 +988,46 @@ fn vm_stop(args: &[String]) {
     // the agent is not possible with standard libkrun (only
     // libkrun-efi supports krun_get_shutdown_eventfd).
     if let Ok(Some(pid)) = arapuca::vm::state::read_lock_pid(&vm_name) {
-        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
-        // SAFETY: pid found via /proc scan, verified running.
-        unsafe { libc::kill(pid as i32, sig) };
-
-        // Wait for the process to exit.
-        for _ in 0..(timeout_secs * 10) {
-            if !arapuca::vm::state::is_running(&vm_name).unwrap_or(true) {
-                break;
+        // Open pidfd once to pin the process for both SIGTERM and SIGKILL.
+        // SAFETY: pidfd_open with valid pid.
+        let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+        if ret >= 0 {
+            let pidfd = ret as libc::c_int;
+            let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+            // SAFETY: pidfd_send_signal with valid pidfd.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
 
-        // Escalate to SIGKILL if still running.
-        if !force && arapuca::vm::state::is_running(&vm_name).unwrap_or(false) {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            for _ in 0..(timeout_secs * 10) {
+                if !arapuca::vm::state::is_running(&vm_name).unwrap_or(true) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            if !force && arapuca::vm::state::is_running(&vm_name).unwrap_or(false) {
+                // SAFETY: pidfd_send_signal with valid pidfd.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd,
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0u32,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+
+            // SAFETY: pidfd is a valid open fd.
+            unsafe { libc::close(pidfd) };
         }
     }
 
@@ -1022,13 +1046,33 @@ fn vm_stop(args: &[String]) {
 #[cfg(feature = "microvm")]
 fn kill_passt_from_config(config: &arapuca::vm::state::VmConfig) {
     if let Some(passt_pid) = config.passt_pid {
+        // Open pidfd first to pin the process, then verify /proc/comm.
+        // SAFETY: pidfd_open with valid pid.
+        let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, passt_pid as i32, 0) };
+        if ret < 0 {
+            return;
+        }
+        let pidfd = ret as libc::c_int;
+
         let comm = format!("/proc/{passt_pid}/comm");
-        if let Ok(c) = std::fs::read_to_string(&comm) {
-            if c.trim() == "passt" {
-                // SAFETY: passt_pid verified via /proc/comm.
-                unsafe { libc::kill(passt_pid as i32, libc::SIGKILL) };
+        let is_passt = std::fs::read_to_string(&comm)
+            .map(|c| c.trim() == "passt")
+            .unwrap_or(false);
+
+        if is_passt {
+            // SAFETY: pidfd_send_signal with valid pidfd.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
             }
         }
+        // SAFETY: pidfd is a valid open fd.
+        unsafe { libc::close(pidfd) };
     }
 }
 
@@ -1458,7 +1502,7 @@ fn vm_run(args: &[String]) {
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if let Some(secs) = timeout {
-        let pid = process.pid();
+        let pid = process.pid() as i32;
         let done_clone = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
@@ -1467,19 +1511,23 @@ fn vm_run(args: &[String]) {
                 return;
             }
             eprintln!("arapuca: timeout ({secs}s), killing VM");
-            // SAFETY: pid is valid and not yet recycled (done is false).
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            let _ = pidfd_kill(pid, libc::SIGTERM);
             std::thread::sleep(std::time::Duration::from_secs(5));
             if done_clone.load(Ordering::Acquire) {
                 return;
             }
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let _ = pidfd_kill(pid, libc::SIGKILL);
         });
     }
 
     let status = process.wait();
     done.store(true, std::sync::atomic::Ordering::Release);
     VM_PID.store(0, std::sync::atomic::Ordering::Release);
+    let pidfd = VM_PIDFD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+    if pidfd >= 0 {
+        // SAFETY: pidfd is a valid open file descriptor.
+        unsafe { libc::close(pidfd) };
+    }
 
     let exit_code = match status {
         Ok(s) => {
@@ -1510,6 +1558,43 @@ fn vm_run(args: &[String]) {
 #[cfg(all(feature = "microvm", unix))]
 static VM_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+#[cfg(all(feature = "microvm", unix))]
+static VM_PIDFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Send a signal to a process via pidfd, avoiding PID recycling races.
+/// Returns Ok if the signal was sent, Err if the process is gone or
+/// pidfd_open/pidfd_send_signal failed.
+#[cfg(all(feature = "microvm", target_os = "linux"))]
+fn pidfd_kill(pid: i32, sig: libc::c_int) -> Result<(), std::io::Error> {
+    // SAFETY: pidfd_open is a syscall with valid pid and no flags.
+    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = ret as libc::c_int;
+    // SAFETY: pidfd_send_signal with valid fd, signal, no siginfo.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    let send_err = if ret < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // SAFETY: fd is a valid open pidfd.
+    unsafe { libc::close(fd) };
+    match send_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Install signal handlers that forward SIGINT/SIGTERM to the VM
 /// child process. First signal sends SIGTERM for graceful shutdown;
 /// second signal sends SIGKILL.
@@ -1521,20 +1606,45 @@ fn install_signal_forwarder(child_pid: i32) {
 
     VM_PID.store(child_pid, Ordering::Release);
 
+    // Open pidfd immediately — the child PID is guaranteed valid
+    // (just spawned, not yet waited). The pidfd prevents PID
+    // recycling races in the signal handler.
+    // SAFETY: pidfd_open with valid pid.
+    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+    if ret >= 0 {
+        VM_PIDFD.store(ret as i32, Ordering::Release);
+    }
+
+    SIGNAL_COUNT.store(0, Ordering::Release);
+
     extern "C" fn handler(_sig: libc::c_int) {
-        let pid = VM_PID.load(Ordering::Acquire);
-        if pid <= 0 {
-            return;
-        }
         let count = SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
-        if count == 0 {
-            // First signal: SIGTERM for graceful shutdown.
-            // SAFETY: pid is a valid child PID, SIGTERM is safe.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+        let sig = if count == 0 {
+            libc::SIGTERM
         } else {
-            // Second signal: SIGKILL.
-            // SAFETY: pid is a valid child PID.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            libc::SIGKILL
+        };
+
+        // Prefer pidfd (race-free). Fall back to kill() if pidfd
+        // was unavailable (pre-5.3 kernel, EMFILE, etc.).
+        let pidfd = VM_PIDFD.load(Ordering::Acquire);
+        if pidfd >= 0 {
+            // SAFETY: pidfd_send_signal is a syscall (async-signal-safe).
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+        } else {
+            let pid = VM_PID.load(Ordering::Acquire);
+            if pid > 0 {
+                // SAFETY: kill is async-signal-safe.
+                unsafe { libc::kill(pid, sig) };
+            }
         }
     }
 
