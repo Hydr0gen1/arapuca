@@ -655,4 +655,60 @@ mod tests {
         );
         assert_eq!(code, 42, "namespace flag should override thread flag");
     }
+
+    #[test]
+    fn execveat_without_empty_path_allowed() {
+        let (exited, code) = run_in_filtered_child(|| {
+            // execveat with flags=0 (no AT_EMPTY_PATH) should NOT be
+            // blocked by seccomp. The null path causes EFAULT, not EPERM.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_execveat,
+                    libc::AT_FDCWD,
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<*const libc::c_char>(),
+                    std::ptr::null::<*const libc::c_char>(),
+                    0i32,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno != libc::EPERM {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(
+            code, 42,
+            "execveat without AT_EMPTY_PATH should not be blocked"
+        );
+    }
+
+    #[test]
+    fn execveat_combined_flags_with_empty_path_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            // execveat with AT_EMPTY_PATH combined with other flags
+            // should still be blocked by the MaskedEq filter.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_execveat,
+                    -1i32,
+                    b"\0".as_ptr(),
+                    std::ptr::null::<*const libc::c_char>(),
+                    std::ptr::null::<*const libc::c_char>(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::EPERM {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(
+            code, 42,
+            "AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW should be blocked"
+        );
+    }
 }
