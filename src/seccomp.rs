@@ -287,6 +287,11 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
         libc::SYS_pidfd_send_signal,
+        libc::SYS_process_madvise,
+        libc::SYS_memfd_secret,
+        libc::SYS_landlock_create_ruleset,
+        libc::SYS_landlock_add_rule,
+        libc::SYS_landlock_restrict_self,
     ]
 }
 
