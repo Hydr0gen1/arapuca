@@ -28,21 +28,56 @@ pub fn sanitize_task_id(id: &str) -> crate::Result<&str> {
     Ok(id)
 }
 
-/// Reject paths that include `/sys/fs/cgroup`.
+/// Reject paths that resolve to `/sys/fs/cgroup`.
 ///
 /// Defense-in-depth: prevents a sandboxed process from modifying its own
 /// cgroup resource limits (memory.max, cpu.max, pids.max) if the path
 /// were allowed through Landlock.
+///
+/// Uses both lexical normalization (handles `..`/`.` without filesystem
+/// access) and filesystem canonicalization (resolves symlinks for paths
+/// that exist). Landlock itself resolves paths at enforcement time, so
+/// this check is defense-in-depth.
 pub fn reject_cgroup_paths(paths: &[std::path::PathBuf]) -> crate::Result<()> {
     for p in paths {
-        let s = p.to_string_lossy();
-        if s.starts_with("/sys/fs/cgroup") {
+        let normalized = normalize_path(p);
+        let ns = normalized.to_string_lossy();
+        if ns.starts_with("/sys/fs/cgroup") {
             return Err(Error::Validation(format!(
-                "path must not include /sys/fs/cgroup: {s}"
+                "path must not include /sys/fs/cgroup: {}",
+                p.display()
             )));
+        }
+        if let Ok(resolved) = std::fs::canonicalize(p) {
+            let rs = resolved.to_string_lossy();
+            if rs.starts_with("/sys/fs/cgroup") {
+                return Err(Error::Validation(format!(
+                    "path must not include /sys/fs/cgroup: {}",
+                    p.display()
+                )));
+            }
         }
     }
     Ok(())
+}
+
+/// Lexically normalize a path by resolving `.` and `..` components
+/// without accessing the filesystem.
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                if parts.last() != Some(&Component::RootDir) {
+                    parts.pop();
+                }
+            }
+            Component::CurDir => {}
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
 }
 
 #[cfg(test)]
@@ -108,5 +143,47 @@ mod tests {
     #[test]
     fn empty_paths_ok() {
         assert!(reject_cgroup_paths(&[]).is_ok());
+    }
+
+    #[test]
+    fn cgroup_path_dotdot_bypass_rejected() {
+        let paths = vec![PathBuf::from("/nonexistent/../sys/fs/cgroup")];
+        assert!(reject_cgroup_paths(&paths).is_err());
+    }
+
+    #[test]
+    fn cgroup_path_dot_component_rejected() {
+        let paths = vec![PathBuf::from("/sys/fs/./cgroup/user.slice")];
+        assert!(reject_cgroup_paths(&paths).is_err());
+    }
+
+    #[test]
+    fn cgroup_path_excessive_dotdot_rejected() {
+        let paths = vec![PathBuf::from("/../../../sys/fs/cgroup")];
+        assert!(reject_cgroup_paths(&paths).is_err());
+    }
+
+    #[test]
+    fn normalize_preserves_root_on_excess_dotdot() {
+        assert_eq!(
+            normalize_path(&PathBuf::from("/../../../sys/fs/cgroup")),
+            PathBuf::from("/sys/fs/cgroup")
+        );
+    }
+
+    #[test]
+    fn normalize_resolves_dotdot() {
+        assert_eq!(
+            normalize_path(&PathBuf::from("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+    }
+
+    #[test]
+    fn normalize_resolves_dot() {
+        assert_eq!(
+            normalize_path(&PathBuf::from("/a/./b")),
+            PathBuf::from("/a/b")
+        );
     }
 }
