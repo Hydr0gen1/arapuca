@@ -16,7 +16,12 @@ mod darwin_profile;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
+use crate::audit::{
+    AuditContext, AuditEvent, AuditVerbosity, SCHEMA_VERSION, SandboxLayer, SkipReason,
+    sanitize_audit_string,
+};
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
 
@@ -149,6 +154,77 @@ impl Sandbox for Darwin {
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
+        let wrapper = Self::wrapper_path();
+        let use_wrapper = wrapper.is_some();
+
+        let audit_ctx = cfg
+            .audit_sink
+            .as_ref()
+            .map(|sink| AuditContext::new(Arc::clone(sink), cfg.audit_verbosity.clone()));
+
+        if let Some(ref ctx) = audit_ctx {
+            let args_field = match ctx.verbosity() {
+                AuditVerbosity::Verbose => {
+                    Some(args.iter().map(|a| sanitize_audit_string(a)).collect())
+                }
+                _ => None,
+            };
+            ctx.emit(AuditEvent::SandboxInit {
+                timestamp: ctx.timestamp(),
+                wall_clock_epoch_ns: ctx.wall_clock_epoch_ns(),
+                schema_version: SCHEMA_VERSION,
+                task_id: sanitize_audit_string(&cfg.task_id),
+                phase: sanitize_audit_string(&cfg.phase),
+                command: sanitize_audit_string(cmd),
+                arg_count: args.len(),
+                args: args_field,
+                principal: cfg.audit_principal.as_deref().map(sanitize_audit_string),
+                correlation_id: cfg
+                    .audit_correlation_id
+                    .as_deref()
+                    .map(sanitize_audit_string),
+            })?;
+
+            for layer in [
+                SandboxLayer::Landlock,
+                SandboxLayer::Seccomp,
+                SandboxLayer::Cgroup,
+                SandboxLayer::NetworkNamespace,
+                SandboxLayer::NoNewPrivs,
+                SandboxLayer::Pdeathsig,
+                SandboxLayer::ProxyBridge,
+            ] {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer,
+                    reason: SkipReason::PlatformUnsupported,
+                })?;
+            }
+
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::Seatbelt,
+                detail: None,
+            })?;
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::Setsid,
+                detail: None,
+            })?;
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::FdSanitization,
+                detail: None,
+            })?;
+            if use_wrapper {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::Rlimit,
+                    detail: None,
+                })?;
+            }
+        }
+
         // Create tmpdir and canonicalize for Seatbelt profile paths.
         // On macOS, /tmp -> /private/tmp. TmpDirGuard holds the canonical
         // path so that guard cleanup, Seatbelt profiles, and Process.tmp_dir
@@ -246,7 +322,6 @@ impl Sandbox for Darwin {
         // Optionally wrap with arapuca binary for rlimits.
         // On macOS the wrapper only applies rlimits (Landlock/seccomp
         // are gated behind cfg(linux)).
-        let wrapper = Self::wrapper_path();
         if let Some(ref wrapper_path) = wrapper {
             let mut wrapper_args = vec!["--".to_string(), actual_cmd];
             wrapper_args.extend(actual_args);
@@ -296,7 +371,16 @@ impl Sandbox for Darwin {
         }
 
         // Append caller-supplied env vars (filtered for safety).
-        env_vars.extend(crate::env::filter_caller_env(&cfg.env).passed);
+        let filter_result = crate::env::filter_caller_env(&cfg.env);
+        env_vars.extend(filter_result.passed);
+
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::EnvPolicy {
+                timestamp: ctx.timestamp(),
+                passed_keys: env_vars.iter().map(|(k, _)| k.clone()).collect(),
+                dropped: filter_result.dropped,
+            })?;
+        }
 
         command.env_clear();
         for (k, v) in &env_vars {
@@ -310,6 +394,32 @@ impl Sandbox for Darwin {
 
         super::fd::validate_extra_fds(&cfg.extra_fds, cfg)?;
         let mut fds_to_inherit = std::mem::ManuallyDrop::new(cfg.extra_fds.clone());
+
+        // Emit SandboxReady before spawn.
+        if let Some(ref ctx) = audit_ctx {
+            let mut applied = vec![
+                SandboxLayer::Seatbelt,
+                SandboxLayer::Setsid,
+                SandboxLayer::EnvFilter,
+                SandboxLayer::FdSanitization,
+            ];
+            if use_wrapper {
+                applied.push(SandboxLayer::Rlimit);
+            }
+            ctx.emit(AuditEvent::SandboxReady {
+                timestamp: ctx.timestamp(),
+                applied_layers: applied,
+                skipped_layers: vec![
+                    SandboxLayer::Landlock,
+                    SandboxLayer::Seccomp,
+                    SandboxLayer::Cgroup,
+                    SandboxLayer::NetworkNamespace,
+                    SandboxLayer::NoNewPrivs,
+                    SandboxLayer::Pdeathsig,
+                    SandboxLayer::ProxyBridge,
+                ],
+            })?;
+        }
 
         // SAFETY: pre_exec runs between fork and exec. Only async-signal-safe
         // functions are used (setsid, fcntl, dup2, close). ManuallyDrop
@@ -332,16 +442,41 @@ impl Sandbox for Darwin {
 
         let pid = child.id();
 
+        if let Some(ref ctx) = audit_ctx {
+            if let Err(e) = ctx.emit(AuditEvent::ProcessStarted {
+                timestamp: ctx.timestamp(),
+                pid,
+            }) {
+                log::error!("audit emit failed: {e}");
+            }
+        }
+
         // Start memory monitor thread (best-effort RSS polling).
         Self::start_memory_monitor(pid, cfg.profile.max_memory_mb);
+
+        if let Some(ref ctx) = audit_ctx {
+            let _ = ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::MemoryMonitor,
+                detail: None,
+            });
+        }
 
         // Start parent-PID watchdog (replaces PR_SET_PDEATHSIG).
         Self::start_parent_watchdog(pid);
 
+        if let Some(ref ctx) = audit_ctx {
+            let _ = ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::ParentWatchdog,
+                detail: None,
+            });
+        }
+
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
             tmp_dir: tmp_guard.defuse(),
-            audit_ctx: None,
+            audit_ctx,
             final_stats: None,
         })
     }
