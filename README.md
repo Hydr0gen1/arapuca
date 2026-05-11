@@ -176,7 +176,7 @@ arapuca run \
 | `--cpus N` | CPU percentage (200 = 2 cores) |
 | `--pids N` | Max number of PIDs |
 | `--task-id NAME` | Identifier for cgroup and audit |
-| `--allow-host H:P` | Allow HTTPS to host:port via CONNECT proxy (repeatable, Linux) |
+| `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 
 ### Micro-VM (requires `microvm` feature)
 

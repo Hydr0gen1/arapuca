@@ -283,7 +283,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --cpus N           CPU limit (percentage, 200 = 2 cores)");
             eprintln!("  --pids N           max number of PIDs");
             eprintln!("  --task-id NAME     identifier for cgroup and audit");
-            eprintln!("  --allow-host H:P   allow HTTPS to host:port (repeatable)");
+            eprintln!("  --allow-host H:P   allow HTTPS to host:port or *.domain:port");
             if sep_pos.is_none() && !args.is_empty() {
                 eprintln!();
                 eprintln!("hint: did you forget '--' before the command?");
@@ -430,7 +430,7 @@ fn run_subcommand(args: &[String]) {
                 #[cfg(target_os = "linux")]
                 {
                     let (host, port) = parse_allow_host(spec);
-                    allowed_hosts.push(arapuca::bridge::AllowedHost { host, port });
+                    allowed_hosts.push(arapuca::bridge::AllowedHost::new(host, port));
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -718,9 +718,21 @@ fn parse_allow_host(spec: &str) -> (String, u16) {
     let (host, port_str) = match spec.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
         _ => {
-            eprintln!("arapuca run: invalid --allow-host: {spec} (expected host:port)");
+            eprintln!(
+                "arapuca run: invalid --allow-host: {spec} (expected host:port or *.domain:port)"
+            );
             std::process::exit(125);
         }
+    };
+
+    // Handle wildcard prefix: *.domain.com → .domain.com (suffix match).
+    let (host, is_wildcard) = if let Some(domain) = host.strip_prefix("*.") {
+        (domain, true)
+    } else if host.contains('*') {
+        eprintln!("arapuca run: wildcard must use *.domain format: {host}");
+        std::process::exit(125);
+    } else {
+        (host, false)
     };
 
     // Strip trailing dot (FQDN normalization).
@@ -753,7 +765,13 @@ fn parse_allow_host(spec: &str) -> (String, u16) {
         }
     };
 
-    (host.to_ascii_lowercase(), port)
+    let host = if is_wildcard {
+        format!(".{}", host.to_ascii_lowercase())
+    } else {
+        host.to_ascii_lowercase()
+    };
+
+    (host, port)
 }
 
 #[cfg(target_os = "linux")]

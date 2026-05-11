@@ -79,13 +79,15 @@ preserved.
 
 **-\-allow-host** *host*:*port*
 :   Allow HTTPS traffic to *host*:*port* via a CONNECT proxy tunnel.
-    Repeatable. When specified, the sandboxed process runs in a network
+    Repeatable. Supports exact match (**api.example.com:443**) and
+    wildcard suffix match (**\*.googleapis.com:443** — matches the
+    domain itself and any subdomain). When specified, the sandboxed
+    process runs in a network
     namespace with no direct network access. A CONNECT proxy on the
     host network tunnels traffic only to listed hosts. DNS resolution
     happens in the proxy with IP validation (loopback, RFC 1918,
-    link-local, and cloud metadata addresses are rejected to prevent
-    DNS rebinding SSRF). Exact hostname match only (no wildcards).
-    Linux only.
+    CGNAT, link-local, and cloud metadata addresses are rejected to
+    prevent DNS rebinding SSRF). Linux only.
 
 # ENVIRONMENT (legacy mode)
 

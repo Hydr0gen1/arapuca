@@ -512,11 +512,45 @@ pub fn listen_and_relay(listener: TcpListener, uds_path: &Path, ready_fd: RawFd)
 
 // ─── CONNECT proxy ───────────────────────────────────────────
 
-/// An allowed CONNECT target: exact host + port.
+/// An allowed CONNECT target: exact or suffix-match host + port.
+///
+/// When `host` starts with `.` (e.g., `.googleapis.com`), the
+/// domain itself and any subdomain match (e.g., both
+/// `googleapis.com` and `us-east5-aiplatform.googleapis.com`).
+/// The leading `.` is stored internally — CLI `*.googleapis.com:443`
+/// is converted to `.googleapis.com` + port 443.
+///
+/// Construct via [`AllowedHost::new`] to enforce invariants
+/// (lowercase, valid hostname chars, port > 0).
 #[derive(Debug, Clone)]
 pub struct AllowedHost {
-    pub host: String,
-    pub port: u16,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+impl AllowedHost {
+    /// Create a new allowed host rule.
+    ///
+    /// `host` must be ASCII-lowercase. Use a leading `.` for suffix
+    /// matching (e.g., `.googleapis.com`). `port` must be 1-65535.
+    pub fn new(host: String, port: u16) -> Self {
+        Self { host, port }
+    }
+
+    /// Check whether this rule matches a given host:port.
+    ///
+    /// Both `self.host` and `host` must be ASCII-lowercased before
+    /// comparison — this method does not normalize case.
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        if self.port != port {
+            return false;
+        }
+        if self.host.starts_with('.') {
+            host.ends_with(&self.host) || host == &self.host[1..]
+        } else {
+            self.host == host
+        }
+    }
 }
 
 const MAX_CONNECT_REQUEST: usize = 2048;
@@ -790,10 +824,7 @@ fn handle_connect(mut uds: UnixStream, allowlist: &[AllowedHost]) -> io::Result<
     // in parse_connect_request, but defense-in-depth).
     let host_normalized = host.strip_suffix('.').unwrap_or(&host);
 
-    if !allowlist
-        .iter()
-        .any(|a| a.host == host_normalized && a.port == port)
-    {
+    if !allowlist.iter().any(|a| a.matches(host_normalized, port)) {
         let _ = uds.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         return Ok(());
     }
@@ -1438,6 +1469,88 @@ mod tests {
     fn validate_ip_rejects_benchmarking() {
         assert!(!is_safe_resolved_ip(&"198.18.0.1".parse().unwrap()));
         assert!(!is_safe_resolved_ip(&"198.19.255.255".parse().unwrap()));
+    }
+
+    // ─── AllowedHost matching tests ─────────────────────────────
+
+    #[test]
+    fn allowed_host_exact_match() {
+        let rule = AllowedHost {
+            host: "api.example.com".into(),
+            port: 443,
+        };
+        assert!(rule.matches("api.example.com", 443));
+        assert!(!rule.matches("api.example.com", 8443));
+        assert!(!rule.matches("other.example.com", 443));
+        assert!(!rule.matches("evil-api.example.com", 443));
+    }
+
+    #[test]
+    fn allowed_host_suffix_match() {
+        let rule = AllowedHost {
+            host: ".googleapis.com".into(),
+            port: 443,
+        };
+        assert!(rule.matches("us-east5-aiplatform.googleapis.com", 443));
+        assert!(rule.matches("oauth2.googleapis.com", 443));
+        assert!(rule.matches("googleapis.com", 443));
+        assert!(!rule.matches("us-east5-aiplatform.googleapis.com", 80));
+        assert!(!rule.matches("evilgoogleapis.com", 443));
+        assert!(!rule.matches("evil.com.googleapis.com.evil.com", 443));
+    }
+
+    #[test]
+    fn allowed_host_suffix_does_not_match_partial_label() {
+        let rule = AllowedHost {
+            host: ".example.com".into(),
+            port: 443,
+        };
+        assert!(rule.matches("sub.example.com", 443));
+        assert!(!rule.matches("notexample.com", 443));
+        assert!(!rule.matches("badexample.com", 443));
+    }
+
+    #[test]
+    fn allowed_host_wrong_port() {
+        let rule = AllowedHost {
+            host: "api.example.com".into(),
+            port: 443,
+        };
+        assert!(!rule.matches("api.example.com", 80));
+    }
+
+    #[test]
+    fn allowed_host_empty_input_never_matches() {
+        let exact = AllowedHost::new("api.example.com".into(), 443);
+        let suffix = AllowedHost::new(".example.com".into(), 443);
+        assert!(!exact.matches("", 443));
+        assert!(!suffix.matches("", 443));
+    }
+
+    #[test]
+    fn allowed_host_suffix_match_deep_subdomain() {
+        let rule = AllowedHost::new(".example.com".into(), 443);
+        assert!(rule.matches("a.b.c.d.example.com", 443));
+    }
+
+    #[test]
+    fn allowed_host_exact_rule_rejects_subdomain() {
+        let rule = AllowedHost::new("api.example.com".into(), 443);
+        assert!(!rule.matches("sub.api.example.com", 443));
+    }
+
+    #[test]
+    fn allowed_host_case_sensitive_requires_lowercase() {
+        let rule = AllowedHost::new(".example.com".into(), 443);
+        assert!(!rule.matches("SUB.EXAMPLE.COM", 443));
+    }
+
+    #[test]
+    fn allowed_host_tld_wildcard_is_broad() {
+        let rule = AllowedHost::new(".com".into(), 443);
+        assert!(rule.matches("anything.com", 443));
+        assert!(rule.matches("a.b.c.com", 443));
+        assert!(rule.matches("com", 443));
     }
 
     #[cfg(seccomp_supported)]

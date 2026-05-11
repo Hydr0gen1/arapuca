@@ -405,6 +405,64 @@ fn allow_host_port_overflow_rejected() {
 }
 
 #[test]
+fn allow_host_wildcard_accepted() {
+    // *.domain:port should be accepted as a valid wildcard.
+    // We can't test the actual proxy tunnel without netns, but
+    // we can verify the flag parses without error by checking
+    // that it doesn't exit 125 (validation errors).
+    // If netns is unavailable, the sandbox launch may fail, but
+    // the flag parsing itself should succeed.
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-host",
+            "*.googleapis.com:443",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("invalid"),
+        "wildcard --allow-host should be accepted: {stderr}"
+    );
+}
+
+#[test]
+fn allow_host_wildcard_empty_domain_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "*.:443", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn allow_host_bare_star_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "*:443", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn allow_host_double_star_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-host",
+            "**.example.com:443",
+            "--",
+            "/bin/true",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
 fn no_allow_host_does_not_set_proxy() {
     let output = Command::new(arapuca_bin())
         .args([
