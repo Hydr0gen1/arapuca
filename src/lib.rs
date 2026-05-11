@@ -40,6 +40,7 @@ pub use process::Process;
 pub use error::Error;
 pub use profile::{
     Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
+    SeccompProfile,
 };
 pub use validate::{
     MAX_GUEST_FILE_SIZE, MAX_GUEST_WRITE_FILES, reject_cgroup_paths, sanitize_task_id,

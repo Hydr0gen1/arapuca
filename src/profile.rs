@@ -64,6 +64,35 @@ pub enum ImageSource {
     Distro { name: String, version: String },
 }
 
+/// Seccomp filter profile for the sandbox.
+///
+/// Controls the restrictiveness of the syscall filter applied to the
+/// sandboxed process. The filter is applied by the arapuca wrapper
+/// binary after Landlock and before execve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SeccompProfile {
+    /// Blocks AF_INET/AF_INET6 sockets, symlink, memfd_create,
+    /// io_uring, pidfd, and other syscalls. Designed for untrusted
+    /// code (scripts, build tools, agents).
+    #[default]
+    Strict,
+    /// Blocks only sandbox-escape syscalls (ptrace, mount, namespace
+    /// ops, kernel modules, bpf). Everything else is allowed.
+    /// Designed for trusted-but-isolated applications (Claude Code,
+    /// compilers) that need network sockets, memfd, io_uring, etc.
+    /// Relies on Landlock + netns for the actual confinement.
+    Baseline,
+}
+
+impl SeccompProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Baseline => "baseline",
+        }
+    }
+}
+
 /// Filesystem and resource restrictions for a sandboxed process.
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
@@ -88,6 +117,8 @@ pub struct Profile {
     pub allow_exec: bool,
     /// Use CLONE_NEWNET for network namespace isolation (Linux only).
     pub use_netns: bool,
+    /// Seccomp filter profile. Defaults to Strict.
+    pub seccomp_profile: SeccompProfile,
 }
 
 /// Full configuration for launching a sandboxed process.
