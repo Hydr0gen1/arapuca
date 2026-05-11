@@ -390,20 +390,32 @@ fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler
 /// Relay bytes bidirectionally between a TCP stream and a Unix
 /// domain stream socket.
 ///
-/// Sets `TCP_NODELAY` on the TCP stream. Spawns two threads (one
-/// per direction). When `io::copy` returns on one direction,
-/// shuts down the opposite stream's write half so the peer sees
-/// EOF. Blocks until both directions complete.
+/// Connects to the UDS at `uds_path`, then delegates to
+/// [`relay_connected`] for the bidirectional copy.
 ///
 /// # Errors
 ///
 /// Returns an error if the UDS connection fails or relay setup fails.
 pub fn relay(tcp: TcpStream, uds_path: &Path) -> io::Result<()> {
-    tcp.set_nodelay(true)?;
-    tcp.set_read_timeout(Some(IDLE_TIMEOUT))?;
-
     let uds = UnixStream::connect(uds_path)?;
-    uds.set_read_timeout(Some(IDLE_TIMEOUT))?;
+    relay_connected(uds, tcp, IDLE_TIMEOUT)
+}
+
+/// Relay bytes bidirectionally between already-connected UDS and TCP
+/// streams.
+///
+/// Sets `TCP_NODELAY` on the TCP stream and read timeouts on both
+/// streams. Spawns two threads (one per direction). When `io::copy`
+/// returns on one direction, shuts down the opposite stream's write
+/// half so the peer sees EOF. Blocks until both directions complete.
+pub(crate) fn relay_connected(
+    uds: UnixStream,
+    tcp: TcpStream,
+    timeout: Duration,
+) -> io::Result<()> {
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(timeout))?;
+    uds.set_read_timeout(Some(timeout))?;
 
     let tcp_read = tcp;
     let uds_read = uds;
@@ -428,9 +440,6 @@ pub fn relay(tcp: TcpStream, uds_path: &Path) -> io::Result<()> {
         let _ = tcp_write.shutdown(Shutdown::Write);
     });
 
-    // JoinHandle has no timed join. The relay threads will terminate
-    // once the streams are shut down (io::copy sees EOF or the read
-    // timeout fires).
     let _ = t1.join();
     let _ = t2.join();
 
