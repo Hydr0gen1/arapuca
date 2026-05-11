@@ -177,6 +177,7 @@ arapuca run \
 | `--pids N` | Max number of PIDs |
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
+| `--seccomp MODE` | Seccomp profile: `strict` (default) or `baseline` |
 
 ### Micro-VM (requires `microvm` feature)
 

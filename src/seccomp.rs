@@ -23,6 +23,11 @@ use crate::Error;
 
 /// Apply the seccomp BPF filter to the current process.
 ///
+/// The filter restrictiveness depends on the profile:
+/// - **Strict**: blocks AF_INET, symlink, memfd_create, io_uring, etc.
+/// - **Baseline**: blocks only escape-critical syscalls (ptrace, mount,
+///   namespace ops, kernel modules). Everything else allowed.
+///
 /// This calls `prctl(PR_SET_NO_NEW_PRIVS)` and then installs the filter.
 /// After this call, the process is restricted to allowed syscalls. The
 /// filter is inherited across `fork()` and `execve()`.
@@ -32,10 +37,19 @@ use crate::Error;
 /// Returns an error if filter construction or installation fails.
 /// This is fail-closed — an error means the process is NOT filtered.
 #[must_use = "seccomp errors must be handled — the process may be unfiltered"]
-pub fn apply() -> crate::Result<()> {
-    let filter = build_filter()?;
-    seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
-    log::info!("seccomp: filter applied");
+pub fn apply(profile: &crate::SeccompProfile) -> crate::Result<()> {
+    match profile {
+        crate::SeccompProfile::Strict => {
+            let filter = build_filter()?;
+            seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
+            log::info!("seccomp: strict filter applied");
+        }
+        crate::SeccompProfile::Baseline => {
+            let filter = build_baseline_filter()?;
+            seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
+            log::info!("seccomp: baseline filter applied");
+        }
+    }
     Ok(())
 }
 
@@ -350,18 +364,188 @@ pub(crate) struct SeccompSummary {
     pub execveat_filter: bool,
 }
 
-// NOTE: filter flags are hardcoded to match build_filter(). Update
-// these if those filters become conditional.
-pub(crate) fn summary() -> SeccompSummary {
-    SeccompSummary {
-        tier1_kill_count: tier1_kill_syscalls().len(),
-        tier2_eperm_count: tier2_eperm_syscalls().len(),
-        socket_filter: true,
-        prctl_filter: true,
-        clone_ns_filter: true,
-        clone3_enosys: true,
-        execveat_filter: true,
+pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
+    match profile {
+        crate::SeccompProfile::Strict => SeccompSummary {
+            tier1_kill_count: tier1_kill_syscalls().len(),
+            tier2_eperm_count: tier2_eperm_syscalls().len(),
+            socket_filter: true,
+            prctl_filter: true,
+            clone_ns_filter: true,
+            clone3_enosys: true,
+            execveat_filter: true,
+        },
+        crate::SeccompProfile::Baseline => SeccompSummary {
+            tier1_kill_count: baseline_kill_syscalls().len(),
+            tier2_eperm_count: 0,
+            socket_filter: false,
+            prctl_filter: false,
+            clone_ns_filter: true,
+            clone3_enosys: true,
+            execveat_filter: false,
+        },
     }
+}
+
+/// Syscalls unconditionally blocked in the baseline profile.
+fn baseline_kill_syscalls() -> Vec<i64> {
+    vec![
+        libc::SYS_ptrace,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_mount_setattr,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_personality,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+        libc::SYS_kexec_file_load,
+        libc::SYS_reboot,
+        libc::SYS_bpf,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_landlock_create_ruleset,
+        libc::SYS_landlock_add_rule,
+        libc::SYS_landlock_restrict_self,
+        libc::SYS_perf_event_open,
+        libc::SYS_userfaultfd,
+        SYS_LSM_SET_SELF_ATTR,
+    ]
+}
+
+/// Build the baseline seccomp filter (default-allow, explicit deny).
+///
+/// Blocks escape-critical syscalls unconditionally, plus clone() with
+/// namespace flags and clone3 (returns ENOSYS to force fallback to
+/// clone where flags can be inspected).
+fn build_baseline_filter() -> crate::Result<BpfProgram> {
+    let arch = target_arch()?;
+
+    let mut deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    for nr in baseline_kill_syscalls() {
+        deny.insert(nr, vec![]);
+    }
+
+    let filter = SeccompFilter::new(
+        deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::KillProcess,
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build baseline filter: {e}")))?;
+
+    let main_prog: BpfProgram = filter
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| Error::Seccomp(format!("compile baseline: {e}")))?;
+
+    // Stacked filter: block clone with namespace flags.
+    // Default action = Allow (non-clone syscalls pass through).
+    // Match action = KillProcess (clone with ns flags is killed).
+    // We insert clone with a condition that matches when ANY
+    // CLONE_NEW* flag is set. MaskedEq(CLONE_NEW_FLAGS, 0) matches
+    // when no ns flags → we want the inverse.
+    //
+    // Approach: use a default-KillProcess filter that ALLOWS clone
+    // only when no namespace flags are set. Other syscalls get
+    // Allow (they're in the map with empty rules). clone without
+    // ns flags also gets Allow. clone WITH ns flags falls through
+    // to mismatch (KillProcess).
+    //
+    // Actually the simplest approach: use an EPERM filter for clone
+    // with ns flags, matching the strict mode pattern.
+    let mut clone_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+
+    // clone: kill if any CLONE_NEW* flag is present.
+    // MaskedEq(mask, mask) matches when ALL bits in mask are set.
+    // But we want to match when ANY bit is set. BPF can't do OR
+    // directly. The strict mode uses 8 separate conditions ANDed
+    // in one rule — that would match only when ALL 8 flags are set.
+    //
+    // Looking at the strict mode code: it uses
+    // MaskedEq(CLONE_NEWNS, CLONE_NEWNS) for each flag in separate
+    // rules. Multiple rules in the Vec are ORed — if ANY rule
+    // matches, the action fires. So we need one rule per flag.
+    let ns_flags = [
+        libc::CLONE_NEWNS as u64,
+        libc::CLONE_NEWCGROUP as u64,
+        libc::CLONE_NEWUTS as u64,
+        libc::CLONE_NEWIPC as u64,
+        libc::CLONE_NEWUSER as u64,
+        libc::CLONE_NEWPID as u64,
+        libc::CLONE_NEWNET as u64,
+        0x0000_0080, // CLONE_NEWTIME (Linux 5.6+, not yet in libc crate)
+    ];
+    let mut clone_rules = Vec::new();
+    for flag in ns_flags {
+        clone_rules.push(
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Qword,
+                    SeccompCmpOp::MaskedEq(flag),
+                    flag,
+                )
+                .map_err(|e| Error::Seccomp(format!("clone flag condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("clone flag rule: {e}")))?,
+        );
+    }
+    clone_deny.insert(libc::SYS_clone, clone_rules);
+
+    // clone3 is handled by a separate ENOSYS stacked filter below.
+    // Do NOT add it to the deny map — KillProcess would override
+    // the ENOSYS (seccomp takes the most restrictive action).
+
+    let clone_filter = SeccompFilter::new(
+        clone_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::KillProcess,
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build baseline clone filter: {e}")))?;
+
+    let clone_prog: BpfProgram =
+        clone_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile baseline clone filter: {e}"))
+            })?;
+
+    // clone3 ENOSYS filter (same pattern as strict mode).
+    let mut clone3_enosys: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    clone3_enosys.insert(libc::SYS_clone3, vec![]);
+    let clone3_filter = SeccompFilter::new(
+        clone3_enosys.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build baseline clone3 enosys: {e}")))?;
+    let clone3_prog: BpfProgram =
+        clone3_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile baseline clone3 enosys: {e}"))
+            })?;
+
+    // Install stacked filters: ENOSYS first, then clone deny, then main.
+    // Last installed is checked first; most restrictive action wins.
+    seccompiler::apply_filter(&clone3_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline clone3 enosys: {e}")))?;
+    seccompiler::apply_filter(&clone_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline clone filter: {e}")))?;
+
+    Ok(main_prog)
 }
 
 /// Determine the target architecture for seccompiler.
@@ -456,7 +640,7 @@ mod tests {
 
         if pid == 0 {
             // Child: apply filter and run the test.
-            if let Err(e) = apply() {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }

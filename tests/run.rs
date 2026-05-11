@@ -522,3 +522,54 @@ fn allow_host_sets_https_proxy() {
         "HTTPS_PROXY should be set with --allow-host: {stdout}"
     );
 }
+
+// ─── Seccomp profile tests ───────────────────────────────────
+
+#[test]
+fn seccomp_baseline_runs_successfully() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--seccomp", "baseline", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn seccomp_strict_runs_successfully() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--seccomp", "strict", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn seccomp_invalid_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--seccomp", "bogus", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn seccomp_baseline_includes_proc_sys() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "baseline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -r /proc/self/cgroup && echo proc_ok || echo proc_fail",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("proc_ok"),
+        "baseline should grant /proc access: {stdout}"
+    );
+}

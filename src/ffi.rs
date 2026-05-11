@@ -917,7 +917,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         return -1;
     }
     #[cfg(seccomp_supported)]
-    if let Err(e) = crate::seccomp::apply() {
+    if let Err(e) = crate::seccomp::apply(&crate::SeccompProfile::Strict) {
         set_error(&format!("seccomp: {e}"));
         return -1;
     }

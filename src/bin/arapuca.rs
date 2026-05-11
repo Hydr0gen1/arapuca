@@ -123,7 +123,11 @@ fn main() {
 
         #[cfg(seccomp_supported)]
         {
-            if let Err(e) = arapuca::seccomp::apply() {
+            let seccomp_profile = match std::env::var("ARAPUCA_SECCOMP_PROFILE").as_deref() {
+                Ok("baseline") => arapuca::SeccompProfile::Baseline,
+                _ => arapuca::SeccompProfile::Strict,
+            };
+            if let Err(e) = arapuca::seccomp::apply(&seccomp_profile) {
                 audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
                 eprintln!("arapuca: seccomp: {e}");
                 std::process::exit(1);
@@ -261,6 +265,7 @@ fn run_subcommand(args: &[String]) {
     let mut cpus: Option<u32> = None;
     let mut pids: Option<u32> = None;
     let mut task_id: Option<String> = None;
+    let mut seccomp_profile = arapuca::SeccompProfile::Strict;
     #[cfg(target_os = "linux")]
     let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
 
@@ -284,6 +289,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --pids N           max number of PIDs");
             eprintln!("  --task-id NAME     identifier for cgroup and audit");
             eprintln!("  --allow-host H:P   allow HTTPS to host:port or *.domain:port");
+            eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             if sep_pos.is_none() && !args.is_empty() {
                 eprintln!();
                 eprintln!("hint: did you forget '--' before the command?");
@@ -439,6 +445,22 @@ fn run_subcommand(args: &[String]) {
                     std::process::exit(125);
                 }
             }
+            "--seccomp" => {
+                i += 1;
+                let mode = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--seccomp requires a mode (strict or baseline)");
+                    std::process::exit(125);
+                });
+                seccomp_profile = match mode.as_str() {
+                    "strict" => arapuca::SeccompProfile::Strict,
+                    "baseline" => arapuca::SeccompProfile::Baseline,
+                    other => {
+                        eprintln!("arapuca run: unknown seccomp profile: {other}");
+                        eprintln!("valid profiles: strict, baseline");
+                        std::process::exit(125);
+                    }
+                };
+            }
             other => {
                 eprintln!("arapuca run: unknown flag: {other}");
                 eprintln!("hint: did you forget '--' before the command?");
@@ -462,6 +484,16 @@ fn run_subcommand(args: &[String]) {
 
     // Merge default paths with user-specified paths.
     let (mut default_read, mut default_write) = arapuca::env::default_sandbox_paths();
+
+    // Baseline seccomp: add /proc and /sys for runtimes that need them
+    // (Bun/JSC reads /proc/self/maps, /proc/self/cgroup, /proc/version,
+    // /sys/devices/system/cpu/online, etc. during allocator init).
+    // Strict profile intentionally excludes these — see env.rs docs.
+    if seccomp_profile == arapuca::SeccompProfile::Baseline {
+        default_read.push(PathBuf::from("/proc"));
+        default_read.push(PathBuf::from("/sys"));
+    }
+
     default_read.extend(read_only_paths);
     default_write.extend(read_write_paths);
 
@@ -491,6 +523,7 @@ fn run_subcommand(args: &[String]) {
         max_pids: pids.unwrap_or(0),
         allow_exec: true,
         use_netns: connect_proxy_socket.is_some(),
+        seccomp_profile,
         ..Default::default()
     };
 

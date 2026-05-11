@@ -77,6 +77,15 @@ preserved.
 :   Identifier for cgroup directory and audit events. Must match
     **[a-zA-Z0-9-]+**, max 128 characters. Defaults to **run-***pid*.
 
+**-\-seccomp** *mode*
+:   Seccomp BPF filter profile. **strict** (default) blocks AF_INET,
+    symlink, memfd_create, io_uring, and other syscalls — designed for
+    untrusted code. **baseline** blocks only sandbox-escape syscalls
+    (ptrace, mount, namespace ops, kernel modules, bpf) and adds
+    `/proc` + `/sys` read access — designed for trusted-but-isolated
+    applications like Claude Code that need full runtime capabilities
+    while being confined by Landlock + netns.
+
 **-\-allow-host** *host*:*port*
 :   Allow HTTPS traffic to *host*:*port* via a CONNECT proxy tunnel.
     Repeatable. Supports exact match (**api.example.com:443**) and

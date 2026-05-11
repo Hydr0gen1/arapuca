@@ -313,6 +313,13 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
             (profile.max_file_size_mb * 1024 * 1024).to_string(),
         ));
     }
+    // Always emit — never rely on absence encoding Strict.
+    // Linux::launch() calls env_clear() so ambient vars don't leak,
+    // but defense-in-depth: explicit is better than implicit.
+    env.push((
+        "ARAPUCA_SECCOMP_PROFILE".into(),
+        profile.seccomp_profile.as_str().into(),
+    ));
     env
 }
 

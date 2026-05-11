@@ -450,7 +450,7 @@ impl Sandbox for Linux {
 
             #[cfg(seccomp_supported)]
             {
-                let seccomp = crate::seccomp::summary();
+                let seccomp = crate::seccomp::summary(&cfg.profile.seccomp_profile);
                 ctx.emit(AuditEvent::SeccompPolicy {
                     timestamp: ctx.timestamp(),
                     tier1_kill_count: seccomp.tier1_kill_count,
