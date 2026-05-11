@@ -21,6 +21,16 @@
 #define arapuca_BRIDGE_PORT 18080
 
 /**
+ * Maximum size (bytes) for a single guest file's content.
+ */
+#define arapuca_MAX_GUEST_FILE_SIZE (1024 * 1024)
+
+/**
+ * Maximum number of write_files entries.
+ */
+#define arapuca_MAX_GUEST_WRITE_FILES 16
+
+/**
  * Stdin channel (host → guest).
  */
 #define arapuca_CHANNEL_STDIN 0
