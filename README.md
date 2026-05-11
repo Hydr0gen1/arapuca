@@ -147,12 +147,24 @@ arapuca run --memory 2048 --cpus 200 --pids 256 --timeout 600 \
   -v /home/user/project:ro \
   -- python3 agent.py
 
+# Selective HTTPS access (Linux only): network namespace isolates the
+# process, then a CONNECT proxy tunnels traffic only to allowed hosts.
+arapuca run \
+  -v /home/user/project:ro \
+  --allow-host us-east5-aiplatform.googleapis.com:443 \
+  --allow-host oauth2.googleapis.com:443 \
+  --env VERTEXAI_PROJECT=my-project \
+  --timeout 600 --memory 3072 \
+  -- claude --bare -p --model claude-sonnet-4-6
+
 # The sandboxed process:
 # - Can only access default system paths + explicitly granted -v paths
 # - Gets a minimal environment (HOME, TMPDIR, PATH, LANG) + --env vars
 # - Is killed after --timeout seconds (SIGTERM, then SIGKILL after 5s)
 # - Cannot override sandbox-managed env vars (HOME, TMPDIR, PATH, LANG)
 # - /proc, /sys, /dev are NOT accessible by default (opt-in via -v)
+# - With --allow-host: no direct network; HTTPS only to listed hosts
+#   via CONNECT proxy (DNS rebinding protection, IP range validation)
 ```
 
 | Flag | Description |
@@ -164,6 +176,7 @@ arapuca run --memory 2048 --cpus 200 --pids 256 --timeout 600 \
 | `--cpus N` | CPU percentage (200 = 2 cores) |
 | `--pids N` | Max number of PIDs |
 | `--task-id NAME` | Identifier for cgroup and audit |
+| `--allow-host H:P` | Allow HTTPS to host:port via CONNECT proxy (repeatable, Linux) |
 
 ### Micro-VM (requires `microvm` feature)
 
