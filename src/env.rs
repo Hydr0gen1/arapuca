@@ -92,6 +92,9 @@ fn drop_reason(key: &str) -> Option<DropReason> {
             | "NODE_OPTIONS"
             | "PERL5OPT"
             | "PERL5LIB"
+            | "ZDOTDIR"
+            | "IFS"
+            | "PROMPT_COMMAND"
     ) {
         return Some(DropReason::InterpreterInjection);
     }
@@ -110,6 +113,18 @@ fn drop_reason(key: &str) -> Option<DropReason> {
             | "GIT_CONFIG_GLOBAL"
             | "GIT_CONFIG_SYSTEM"
             | "GIT_SSH_COMMAND"
+            | "GIT_SSH"
+            | "GIT_EXEC_PATH"
+            | "GIT_TEMPLATE_DIR"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_ASKPASS"
+            | "GIT_EDITOR"
+            | "GIT_SEQUENCE_EDITOR"
+            | "OPENSSL_CONF"
+            | "EDITOR"
+            | "VISUAL"
+            | "PAGER"
+            | "CARGO_HOME"
     ) {
         return Some(DropReason::RuntimeInjection);
     }
@@ -123,6 +138,11 @@ fn drop_reason(key: &str) -> Option<DropReason> {
             | "all_proxy"
             | "NO_PROXY"
             | "no_proxy"
+            | "ftp_proxy"
+            | "FTP_PROXY"
+            | "SOCKS_PROXY"
+            | "socks_proxy"
+            | "CGI_HTTP_PROXY"
             | "CURL_CA_BUNDLE"
             | "SSL_CERT_FILE"
             | "SSL_CERT_DIR"
@@ -646,5 +666,92 @@ mod tests {
         };
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn filter_drops_shell_injection_extended() {
+        let env: Vec<(String, String)> = ["ZDOTDIR", "IFS", "PROMPT_COMMAND"]
+            .iter()
+            .map(|k| (k.to_string(), "x".into()))
+            .collect();
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped.len(), 3);
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::InterpreterInjection)
+        );
+    }
+
+    #[test]
+    fn filter_drops_openssl_conf() {
+        let env = vec![("OPENSSL_CONF".into(), "/evil.cnf".into())];
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped[0].reason, DropReason::RuntimeInjection);
+    }
+
+    #[test]
+    fn filter_drops_editor_vars() {
+        let env: Vec<(String, String)> = ["EDITOR", "VISUAL", "PAGER"]
+            .iter()
+            .map(|k| (k.to_string(), "/bin/sh".into()))
+            .collect();
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::RuntimeInjection)
+        );
+    }
+
+    #[test]
+    fn filter_drops_git_injection() {
+        let env: Vec<(String, String)> = [
+            "GIT_EXEC_PATH",
+            "GIT_TEMPLATE_DIR",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ASKPASS",
+            "GIT_SSH",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), "/evil".into()))
+        .collect();
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::RuntimeInjection)
+        );
+    }
+
+    #[test]
+    fn filter_drops_proxy_extended() {
+        let env: Vec<(String, String)> = ["ftp_proxy", "SOCKS_PROXY", "CGI_HTTP_PROXY"]
+            .iter()
+            .map(|k| (k.to_string(), "http://evil".into()))
+            .collect();
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::RuntimeInjection)
+        );
+    }
+
+    #[test]
+    fn filter_drops_cargo_home() {
+        let env = vec![("CARGO_HOME".into(), "/tmp/evil-cargo".into())];
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped[0].reason, DropReason::RuntimeInjection);
     }
 }
