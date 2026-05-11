@@ -55,7 +55,7 @@ fn main() {
     let cmd_idx = match sep_idx {
         Some(i) if i + 1 < args.len() => i + 1,
         _ => {
-            eprintln!("arapuca: usage: arapuca [image pull|list|rm] | [-- command ...]");
+            eprintln!("arapuca: usage: arapuca <run|image|vm> | [-- command ...]");
             std::process::exit(1);
         }
     };

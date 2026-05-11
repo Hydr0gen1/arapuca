@@ -122,6 +122,49 @@ ARAPUCA_WRITE_PATHS="/tmp/workspace" \
 # - Is killed if the parent process dies
 ```
 
+### Process Sandbox (`arapuca run`)
+
+Run a command in a process-level sandbox with user-friendly CLI flags.
+Works on Linux, macOS, and Windows — the appropriate isolation
+primitives are selected at compile time.
+
+```bash
+# Run a command with default sandboxing (system paths readable, /tmp writable)
+arapuca run -- /bin/echo hello
+
+# Grant read-only access to a project directory
+arapuca run -v /home/user/project:ro -- ls /home/user/project
+
+# Grant read-write access
+arapuca run -v /home/user/workspace -- python3 build.py
+
+# Pass environment variables (dangerous vars like LD_PRELOAD are filtered)
+arapuca run --env MY_TOKEN=secret --env JIRA_URL=https://jira.example.com \
+  -- python3 agent.py
+
+# Resource limits and timeout
+arapuca run --memory 2048 --cpus 200 --pids 256 --timeout 600 \
+  -v /home/user/project:ro \
+  -- python3 agent.py
+
+# The sandboxed process:
+# - Can only access default system paths + explicitly granted -v paths
+# - Gets a minimal environment (HOME, TMPDIR, PATH, LANG) + --env vars
+# - Is killed after --timeout seconds (SIGTERM, then SIGKILL after 5s)
+# - Cannot override sandbox-managed env vars (HOME, TMPDIR, PATH, LANG)
+# - /proc, /sys, /dev are NOT accessible by default (opt-in via -v)
+```
+
+| Flag | Description |
+|------|-------------|
+| `-v /path[:ro]` | Allow path access (read-write default, `:ro` for read-only) |
+| `--env KEY=VALUE` | Pass environment variable |
+| `--timeout N` | Kill after N seconds |
+| `--memory N` | Memory limit in MB |
+| `--cpus N` | CPU percentage (200 = 2 cores) |
+| `--pids N` | Max number of PIDs |
+| `--task-id NAME` | Identifier for cgroup and audit |
+
 ### Micro-VM (requires `microvm` feature)
 
 Run a command inside a lightweight KVM virtual machine:
@@ -425,10 +468,15 @@ Arapuca provides two interfaces:
 - **Library** (`rlib` + `cdylib`): Rust API and C FFI for embedding
   sandbox enforcement into a host process. The library manages the full
   subprocess lifecycle — launch, wait, resource stats, cleanup.
-- **Binary** (`arapuca -- cmd [args...]`): A wrapper that applies
-  restrictions to itself, then `execve()`s the target command. Used by
-  the library as a subprocess wrapper for Landlock/seccomp/rlimit
-  enforcement (Unix only — not used on Windows).
+- **Binary**: Three modes of operation:
+  - `arapuca run [flags] -- cmd [args...]` — process-level sandbox
+    with CLI flags, using the library's `Sandbox::launch()` trait for
+    cross-platform dispatch (Linux/macOS/Windows)
+  - `arapuca vm run` — micro-VM sandbox via libkrun (Linux only)
+  - `arapuca -- cmd [args...]` — self-sandbox mode that applies
+    restrictions to the current process then `execve()`s the target.
+    Used internally by the library as a subprocess wrapper for
+    Landlock/seccomp/rlimit enforcement
 
 The library spawns sandboxed processes by composing platform-specific
 isolation primitives. On Linux, the binary acts as an inner wrapper
