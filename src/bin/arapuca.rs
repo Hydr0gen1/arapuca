@@ -37,6 +37,10 @@ fn main() {
         vm_subcommand(&args[2..]);
         return;
     }
+    if args.get(1).is_some_and(|a| a == "run") {
+        run_subcommand(&args[2..]);
+        return;
+    }
 
     // Audit FD: if set, write JSON status lines as each layer is applied.
     // The library creates a pipe and passes the write end via this env var.
@@ -241,6 +245,370 @@ fn main() {
         let _ = (c_cmd, c_args, env);
         eprintln!("arapuca: binary not yet supported on this platform");
         std::process::exit(1);
+    }
+}
+
+// ─── Run subcommand ───────────────────────────────────────────
+
+fn run_subcommand(args: &[String]) {
+    use arapuca::platform::Sandbox;
+
+    let mut read_only_paths: Vec<PathBuf> = Vec::new();
+    let mut read_write_paths: Vec<PathBuf> = Vec::new();
+    let mut user_env: Vec<(String, String)> = Vec::new();
+    let mut timeout: Option<u64> = None;
+    let mut memory: Option<u64> = None;
+    let mut cpus: Option<u32> = None;
+    let mut pids: Option<u32> = None;
+    let mut task_id: Option<String> = None;
+
+    // Find -- separator.
+    let sep_pos = args.iter().position(|a| a == "--");
+    let flag_args = match sep_pos {
+        Some(pos) => &args[..pos],
+        None => args,
+    };
+    let cmd_args: &[String] = match sep_pos {
+        Some(pos) if pos + 1 < args.len() => &args[pos + 1..],
+        _ => {
+            eprintln!("usage: arapuca run [flags] -- command [args...]");
+            eprintln!();
+            eprintln!("flags:");
+            eprintln!("  -v /path[:ro]      allow path access (rw default, :ro read-only)");
+            eprintln!("  --env KEY=VALUE    pass environment variable");
+            eprintln!("  --timeout N        kill after N seconds");
+            eprintln!("  --memory N         memory limit in MB");
+            eprintln!("  --cpus N           CPU limit (percentage, 200 = 2 cores)");
+            eprintln!("  --pids N           max number of PIDs");
+            eprintln!("  --task-id NAME     identifier for cgroup and audit");
+            if sep_pos.is_none() && !args.is_empty() {
+                eprintln!();
+                eprintln!("hint: did you forget '--' before the command?");
+            }
+            std::process::exit(125);
+        }
+    };
+
+    // Parse flags.
+    let mut i = 0;
+    while i < flag_args.len() {
+        match flag_args[i].as_str() {
+            "-v" | "--volume" => {
+                i += 1;
+                let spec = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("-v requires a path");
+                    std::process::exit(125);
+                });
+                let (path, ro) = parse_volume_spec(spec);
+                if path.as_os_str().is_empty() {
+                    eprintln!("arapuca run: -v path must not be empty");
+                    std::process::exit(125);
+                }
+                if !path.is_absolute() {
+                    eprintln!("arapuca run: -v path must be absolute: {}", path.display());
+                    std::process::exit(125);
+                }
+                if ro {
+                    read_only_paths.push(path);
+                } else {
+                    read_write_paths.push(path);
+                }
+            }
+            "--env" => {
+                i += 1;
+                let kv = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--env requires KEY=VALUE");
+                    std::process::exit(125);
+                });
+                if let Some((k, v)) = kv.split_once('=') {
+                    if k.is_empty() {
+                        eprintln!("arapuca run: --env key must not be empty");
+                        std::process::exit(125);
+                    }
+                    // Sandbox-managed keys cannot be overridden.
+                    if matches!(k, "HOME" | "TMPDIR" | "PATH" | "LANG") {
+                        eprintln!("arapuca run: --env cannot override sandbox-managed var: {k}");
+                        std::process::exit(125);
+                    }
+                    // Reject vars that the library's filter_caller_env
+                    // would silently drop — fail loud at the CLI boundary.
+                    let probe = vec![(k.to_string(), v.to_string())];
+                    if arapuca::env::filter_caller_env(&probe).passed.is_empty() {
+                        eprintln!("arapuca run: --env {k} is blocked (sandbox security)");
+                        std::process::exit(125);
+                    }
+                    user_env.push((k.to_string(), v.to_string()));
+                } else {
+                    eprintln!("arapuca run: invalid --env: {kv} (expected KEY=VALUE)");
+                    std::process::exit(125);
+                }
+            }
+            "--timeout" => {
+                i += 1;
+                let secs: u64 = flag_args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--timeout requires a positive integer (seconds)");
+                        std::process::exit(125);
+                    });
+                if secs == 0 {
+                    eprintln!("--timeout must be > 0");
+                    std::process::exit(125);
+                }
+                timeout = Some(secs);
+            }
+            "--memory" => {
+                i += 1;
+                memory = Some(
+                    flag_args
+                        .get(i)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("--memory requires a positive integer (MB)");
+                            std::process::exit(125);
+                        }),
+                );
+                if memory == Some(0) {
+                    eprintln!("--memory must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "--cpus" => {
+                i += 1;
+                cpus = Some(
+                    flag_args
+                        .get(i)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("--cpus requires a positive integer");
+                            std::process::exit(125);
+                        }),
+                );
+                if cpus == Some(0) {
+                    eprintln!("--cpus must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "--pids" => {
+                i += 1;
+                pids = Some(
+                    flag_args
+                        .get(i)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("--pids requires a positive integer");
+                            std::process::exit(125);
+                        }),
+                );
+                if pids == Some(0) {
+                    eprintln!("--pids must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "--task-id" => {
+                i += 1;
+                task_id = Some(
+                    flag_args
+                        .get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("--task-id requires a value");
+                            std::process::exit(125);
+                        })
+                        .clone(),
+                );
+            }
+            other => {
+                eprintln!("arapuca run: unknown flag: {other}");
+                eprintln!("hint: did you forget '--' before the command?");
+                std::process::exit(125);
+            }
+        }
+        i += 1;
+    }
+
+    // Merge default paths with user-specified paths.
+    let (mut default_read, mut default_write) = arapuca::env::default_sandbox_paths();
+    default_read.extend(read_only_paths);
+    default_write.extend(read_write_paths);
+
+    let read_paths = arapuca::env::canonicalize_paths(&default_read);
+    let write_paths = arapuca::env::canonicalize_paths(&default_write);
+
+    arapuca::reject_cgroup_paths(&read_paths).unwrap_or_else(|e| {
+        eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    });
+    arapuca::reject_cgroup_paths(&write_paths).unwrap_or_else(|e| {
+        eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    });
+
+    let task = task_id.unwrap_or_else(|| format!("run-{}", std::process::id()));
+    arapuca::sanitize_task_id(&task).unwrap_or_else(|e| {
+        eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    });
+
+    let profile = arapuca::Profile {
+        read_paths,
+        write_paths,
+        max_memory_mb: memory.unwrap_or(0),
+        max_cpu_pct: cpus.unwrap_or(0),
+        max_pids: pids.unwrap_or(0),
+        allow_exec: true,
+        use_netns: false,
+        ..Default::default()
+    };
+
+    let config = arapuca::Config {
+        profile,
+        socket_dir: PathBuf::new(),
+        task_id: task,
+        phase: "run".into(),
+        work_dir: None,
+        #[cfg(unix)]
+        stdin: None,
+        #[cfg(unix)]
+        stdout: None,
+        #[cfg(unix)]
+        stderr: None,
+        #[cfg(unix)]
+        extra_fds: Vec::new(),
+        network_proxy_socket: None,
+        env: user_env,
+        audit_sink: None,
+        audit_verbosity: arapuca::audit::AuditVerbosity::Standard,
+        audit_principal: None,
+        audit_correlation_id: None,
+    };
+
+    let sandbox = arapuca::platform::new().unwrap_or_else(|e| {
+        eprintln!("arapuca run: sandbox init: {e}");
+        std::process::exit(125);
+    });
+
+    let cmd = &cmd_args[0];
+    let cmd_rest: Vec<&str> = cmd_args[1..].iter().map(|s| s.as_str()).collect();
+
+    let mut process = match sandbox.launch(&config, cmd, &cmd_rest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("arapuca run: launch failed: {e}");
+            std::process::exit(125);
+        }
+    };
+
+    // Forward SIGINT/SIGTERM to the sandboxed child.
+    #[cfg(unix)]
+    install_signal_forwarder(process.pid() as i32);
+
+    // Timeout enforcement.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    if let Some(secs) = timeout {
+        let done_clone = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            eprintln!("arapuca run: timeout ({secs}s), sending SIGTERM");
+            signal_child(libc::SIGTERM);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            signal_child(libc::SIGKILL);
+        });
+    }
+
+    let status = process.wait();
+    done.store(true, std::sync::atomic::Ordering::Release);
+
+    #[cfg(unix)]
+    {
+        CHILD_PID.store(0, std::sync::atomic::Ordering::Release);
+        let pidfd = CHILD_PIDFD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+        if pidfd >= 0 {
+            // SAFETY: pidfd is a valid open file descriptor.
+            unsafe { libc::close(pidfd) };
+        }
+    }
+
+    let exit_code = match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                code
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    128 + s.signal().unwrap_or(9)
+                }
+                #[cfg(not(unix))]
+                {
+                    137
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("arapuca run: wait: {e}");
+            125
+        }
+    };
+
+    process.cleanup();
+    std::process::exit(exit_code);
+}
+
+fn parse_volume_spec(spec: &str) -> (PathBuf, bool) {
+    let lower = spec.to_ascii_lowercase();
+    if lower.ends_with(":ro") {
+        (PathBuf::from(&spec[..spec.len() - 3]), true)
+    } else if lower.ends_with(":rw") {
+        (PathBuf::from(&spec[..spec.len() - 3]), false)
+    } else {
+        (PathBuf::from(spec), false)
+    }
+}
+
+/// Send a signal to the child process via the stored CHILD_PIDFD
+/// (race-free on Linux) or CHILD_PID (fallback on other Unix).
+#[cfg(target_os = "linux")]
+fn signal_child(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+
+    let pidfd = CHILD_PIDFD.load(Ordering::Acquire);
+    if pidfd >= 0 {
+        // SAFETY: pidfd is valid (opened at spawn, not yet closed).
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            );
+        }
+    } else {
+        let pid = CHILD_PID.load(Ordering::Acquire);
+        if pid > 0 {
+            // SAFETY: kill with valid pid and signal.
+            unsafe { libc::kill(pid, sig) };
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn signal_child(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+
+    let pid = CHILD_PID.load(Ordering::Acquire);
+    if pid > 0 {
+        // SAFETY: kill with valid pid and signal.
+        unsafe { libc::kill(pid, sig) };
     }
 }
 
@@ -1502,7 +1870,6 @@ fn vm_run(args: &[String]) {
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if let Some(secs) = timeout {
-        let pid = process.pid() as i32;
         let done_clone = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
@@ -1511,19 +1878,19 @@ fn vm_run(args: &[String]) {
                 return;
             }
             eprintln!("arapuca: timeout ({secs}s), killing VM");
-            let _ = pidfd_kill(pid, libc::SIGTERM);
+            signal_child(libc::SIGTERM);
             std::thread::sleep(std::time::Duration::from_secs(5));
             if done_clone.load(Ordering::Acquire) {
                 return;
             }
-            let _ = pidfd_kill(pid, libc::SIGKILL);
+            signal_child(libc::SIGKILL);
         });
     }
 
     let status = process.wait();
     done.store(true, std::sync::atomic::Ordering::Release);
-    VM_PID.store(0, std::sync::atomic::Ordering::Release);
-    let pidfd = VM_PIDFD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+    CHILD_PID.store(0, std::sync::atomic::Ordering::Release);
+    let pidfd = CHILD_PIDFD.swap(-1, std::sync::atomic::Ordering::AcqRel);
     if pidfd >= 0 {
         // SAFETY: pidfd is a valid open file descriptor.
         unsafe { libc::close(pidfd) };
@@ -1555,56 +1922,25 @@ fn vm_run(args: &[String]) {
     std::process::exit(exit_code);
 }
 
-#[cfg(all(feature = "microvm", unix))]
-static VM_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(unix)]
+static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-#[cfg(all(feature = "microvm", unix))]
-static VM_PIDFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static CHILD_PIDFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// Send a signal to a process via pidfd, avoiding PID recycling races.
-/// Returns Ok if the signal was sent, Err if the process is gone or
-/// pidfd_open/pidfd_send_signal failed.
-#[cfg(all(feature = "microvm", target_os = "linux"))]
-fn pidfd_kill(pid: i32, sig: libc::c_int) -> Result<(), std::io::Error> {
-    // SAFETY: pidfd_open is a syscall with valid pid and no flags.
-    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = ret as libc::c_int;
-    // SAFETY: pidfd_send_signal with valid fd, signal, no siginfo.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            fd,
-            sig,
-            std::ptr::null::<libc::siginfo_t>(),
-            0u32,
-        )
-    };
-    let send_err = if ret < 0 {
-        Some(std::io::Error::last_os_error())
-    } else {
-        None
-    };
-    // SAFETY: fd is a valid open pidfd.
-    unsafe { libc::close(fd) };
-    match send_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// Install signal handlers that forward SIGINT/SIGTERM to the VM
-/// child process. First signal sends SIGTERM for graceful shutdown;
-/// second signal sends SIGKILL.
-#[cfg(all(feature = "microvm", unix))]
+/// Install signal handlers that forward SIGINT/SIGTERM to a child
+/// process. First signal sends SIGTERM for graceful shutdown; second
+/// signal sends SIGKILL.
+///
+/// Linux: uses pidfd for race-free signal delivery with kill() fallback.
+/// Other Unix: uses plain kill() (no pidfd on macOS/BSD).
+#[cfg(target_os = "linux")]
 fn install_signal_forwarder(child_pid: i32) {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     static SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
-    VM_PID.store(child_pid, Ordering::Release);
+    CHILD_PID.store(child_pid, Ordering::Release);
 
     // Open pidfd immediately — the child PID is guaranteed valid
     // (just spawned, not yet waited). The pidfd prevents PID
@@ -1612,7 +1948,7 @@ fn install_signal_forwarder(child_pid: i32) {
     // SAFETY: pidfd_open with valid pid.
     let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
     if ret >= 0 {
-        VM_PIDFD.store(ret as i32, Ordering::Release);
+        CHILD_PIDFD.store(ret as i32, Ordering::Release);
     }
 
     SIGNAL_COUNT.store(0, Ordering::Release);
@@ -1627,7 +1963,7 @@ fn install_signal_forwarder(child_pid: i32) {
 
         // Prefer pidfd (race-free). Fall back to kill() if pidfd
         // was unavailable (pre-5.3 kernel, EMFILE, etc.).
-        let pidfd = VM_PIDFD.load(Ordering::Acquire);
+        let pidfd = CHILD_PIDFD.load(Ordering::Acquire);
         if pidfd >= 0 {
             // SAFETY: pidfd_send_signal is a syscall (async-signal-safe).
             unsafe {
@@ -1640,7 +1976,7 @@ fn install_signal_forwarder(child_pid: i32) {
                 );
             }
         } else {
-            let pid = VM_PID.load(Ordering::Acquire);
+            let pid = CHILD_PID.load(Ordering::Acquire);
             if pid > 0 {
                 // SAFETY: kill is async-signal-safe.
                 unsafe { libc::kill(pid, sig) };
@@ -1652,6 +1988,40 @@ fn install_signal_forwarder(child_pid: i32) {
     // delivery (System V semantics). sigaction keeps the handler
     // installed across invocations.
     // SAFETY: handler is async-signal-safe (only atomics + kill).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        let handler_ptr: extern "C" fn(libc::c_int) = handler;
+        sa.sa_sigaction = handler_ptr as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Non-Linux Unix variant: plain kill() without pidfd.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn install_signal_forwarder(child_pid: i32) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
+
+    CHILD_PID.store(child_pid, Ordering::Release);
+    SIGNAL_COUNT.store(0, Ordering::Release);
+
+    extern "C" fn handler(_sig: libc::c_int) {
+        let count = SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
+        let sig = if count == 0 {
+            libc::SIGTERM
+        } else {
+            libc::SIGKILL
+        };
+        let pid = CHILD_PID.load(Ordering::Acquire);
+        if pid > 0 {
+            // SAFETY: kill is async-signal-safe.
+            unsafe { libc::kill(pid, sig) };
+        }
+    }
+
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         let handler_ptr: extern "C" fn(libc::c_int) = handler;
