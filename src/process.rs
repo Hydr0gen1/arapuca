@@ -101,6 +101,9 @@ impl Process {
                         std::io::Error::last_os_error()
                     )));
                 }
+                // Mark as reaped so Drop's *pid > 0 guard skips it,
+                // preventing SIGKILL to a recycled PID.
+                *child_pid = 0;
                 std::process::ExitStatus::from_raw(wstatus)
             }
         };
@@ -221,8 +224,9 @@ impl Process {
     /// Clean up the sandbox temp directory and cgroup.
     ///
     /// Must only be called after `wait()` returns. Uses `take()` on
-    /// Option fields so the Drop impl (which runs after this method
-    /// returns) sees None and does not double-cleanup.
+    /// cgroup/Windows fields so Drop sees None and does not double-
+    /// cleanup. For tmpdir, Drop uses an `exists()` guard instead
+    /// (tmpdir stays PathBuf to preserve the public API).
     #[allow(unused_mut)]
     pub fn cleanup(mut self) {
         #[allow(unused_mut)]
