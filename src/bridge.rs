@@ -4,7 +4,7 @@
 //! for bridging network access inside an isolated network namespace.
 //! Linux-only.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -510,6 +510,571 @@ pub fn listen_and_relay(listener: TcpListener, uds_path: &Path, ready_fd: RawFd)
     Ok(())
 }
 
+// ─── CONNECT proxy ───────────────────────────────────────────
+
+/// An allowed CONNECT target: exact host + port.
+#[derive(Debug, Clone)]
+pub struct AllowedHost {
+    pub host: String,
+    pub port: u16,
+}
+
+const MAX_CONNECT_REQUEST: usize = 2048;
+const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Parse an HTTP CONNECT request from a stream.
+///
+/// Reads byte-by-byte until `\r\n\r\n` (max [`MAX_CONNECT_REQUEST`]
+/// bytes). Parses the first line as `CONNECT host:port HTTP/1.x`.
+/// Returns the target `(host, port)`. Only the request line is used;
+/// additional headers are consumed but ignored (prevents Host header
+/// smuggling).
+///
+/// Byte-by-byte reading prevents over-reading into the TLS handshake
+/// data that follows the CONNECT request.
+pub fn parse_connect_request(stream: &mut impl io::Read) -> io::Result<(String, u16)> {
+    let mut buf = Vec::with_capacity(256);
+    let mut found_end = false;
+
+    for _ in 0..MAX_CONNECT_REQUEST {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte)?;
+        buf.push(byte[0]);
+        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+            found_end = true;
+            break;
+        }
+    }
+
+    if !found_end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CONNECT request too large or missing terminator",
+        ));
+    }
+
+    let header = std::str::from_utf8(&buf).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CONNECT request not valid UTF-8",
+        )
+    })?;
+
+    let first_line = header.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+    if parts.len() != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed CONNECT request line: {first_line}"),
+        ));
+    }
+
+    if !parts[0].eq_ignore_ascii_case("CONNECT") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected CONNECT method, got: {}", parts[0]),
+        ));
+    }
+
+    if parts[2] != "HTTP/1.0" && parts[2] != "HTTP/1.1" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported HTTP version: {}", parts[2]),
+        ));
+    }
+
+    let target = parts[1];
+    let (host, port_str) = target.rsplit_once(':').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CONNECT target missing port: {target}"),
+        )
+    })?;
+
+    if host.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CONNECT target has empty host",
+        ));
+    }
+
+    let port: u16 = port_str.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid CONNECT port: {port_str}"),
+        )
+    })?;
+
+    if port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CONNECT port must be 1-65535",
+        ));
+    }
+
+    // Validate hostname: ASCII alphanumeric, `-`, `.` only.
+    // Rejects IPv6 bracket notation `[::1]`.
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid hostname characters: {host}"),
+        ));
+    }
+
+    // Strip trailing dot (FQDN normalization).
+    let host = host.strip_suffix('.').unwrap_or(host);
+
+    // Reject malformed hostnames (matches CLI parse_allow_host validation).
+    if host.is_empty() || host.starts_with('.') || host.contains("..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid hostname: {host}"),
+        ));
+    }
+
+    Ok((host.to_ascii_lowercase(), port))
+}
+
+/// Check whether a resolved IP address is safe for outbound connection.
+///
+/// Rejects loopback, RFC 1918, link-local, cloud metadata, IPv6
+/// unique-local, and unspecified addresses. Also canonicalizes
+/// IPv4-mapped IPv6 addresses (`::ffff:X.X.X.X`) to their inner
+/// IPv4 before checking — without this, `::ffff:127.0.0.1` would
+/// bypass `is_loopback()`.
+pub fn is_safe_resolved_ip(addr: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
+    match addr {
+        IpAddr::V4(ip) => is_safe_ipv4(ip),
+        IpAddr::V6(ip) => {
+            // Canonicalize IPv4-mapped IPv6 (::ffff:X.X.X.X).
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_safe_ipv4(&mapped);
+            }
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !is_ipv6_link_local(ip)
+                && !is_ipv6_unique_local(ip)
+        }
+    }
+}
+
+fn is_safe_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !ip.is_loopback()
+        && !ip.is_private()
+        && !ip.is_link_local()
+        && !ip.is_broadcast()
+        && !ip.is_unspecified()
+        // "This network" 0.0.0.0/8 — only 0.0.0.0 is caught by
+        // is_unspecified(); 0.0.0.1+ reaches localhost on Linux.
+        && o[0] != 0
+        // Carrier-Grade NAT (RFC 6598): 100.64.0.0/10 — used by
+        // AWS VPC, GCP, Tailscale, Kubernetes for internal infra.
+        && !(o[0] == 100 && (64..=127).contains(&o[1]))
+        // Benchmarking (RFC 2544): 198.18.0.0/15
+        && !(o[0] == 198 && (18..=19).contains(&o[1]))
+}
+
+fn is_ipv6_link_local(ip: &std::net::Ipv6Addr) -> bool {
+    // fe80::/10
+    let seg = ip.segments();
+    (seg[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv6_unique_local(ip: &std::net::Ipv6Addr) -> bool {
+    // fc00::/7
+    let seg = ip.segments();
+    (seg[0] & 0xfe00) == 0xfc00
+}
+
+/// RAII guard for the connection counter.
+struct ConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionGuard {
+    fn new(active: &Arc<AtomicUsize>) -> Option<Self> {
+        let prev = active.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(Self {
+            active: Arc::clone(active),
+        })
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Accept connections on a UDS listener and handle CONNECT requests.
+///
+/// For each connection: parse the CONNECT request, check the target
+/// against the allowlist, resolve DNS, validate the resolved IP,
+/// then tunnel bytes to the target.
+///
+/// # Preconditions
+///
+/// The `UnixListener` must be bound and listening before this function
+/// is called. The seccomp filter blocks `listen`, so the listener must
+/// be set up pre-seccomp.
+///
+/// # Safety
+///
+/// `ready_fd` must be a valid, open file descriptor for a pipe write
+/// end that the caller owns. It will be closed after the readiness
+/// byte is sent.
+pub fn connect_proxy_listen(
+    listener: std::os::unix::net::UnixListener,
+    allowlist: &[AllowedHost],
+    ready_fd: RawFd,
+) -> io::Result<()> {
+    // SAFETY: caller guarantees ready_fd is a valid, owned pipe write end.
+    let ready = unsafe { OwnedFd::from_raw_fd(ready_fd) };
+
+    let written =
+        unsafe { libc::write(ready.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(ready);
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let allowed = Arc::new(allowlist.to_vec());
+
+    for stream in listener.incoming() {
+        let uds = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("connect proxy accept: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+
+        let Some(guard) = ConnectionGuard::new(&active) else {
+            drop(uds);
+            continue;
+        };
+
+        let hosts = Arc::clone(&allowed);
+
+        std::thread::spawn(move || {
+            let _guard = guard;
+            if let Err(e) = handle_connect(uds, &hosts) {
+                log::debug!("connect proxy: {e}");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn handle_connect(mut uds: UnixStream, allowlist: &[AllowedHost]) -> io::Result<()> {
+    uds.set_read_timeout(Some(CONNECT_HANDSHAKE_TIMEOUT))?;
+
+    let (host, port) = parse_connect_request(&mut uds)?;
+
+    // Strip trailing dot for allowlist comparison (already stripped
+    // in parse_connect_request, but defense-in-depth).
+    let host_normalized = host.strip_suffix('.').unwrap_or(&host);
+
+    if !allowlist
+        .iter()
+        .any(|a| a.host == host_normalized && a.port == port)
+    {
+        let _ = uds.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        return Ok(());
+    }
+
+    // Resolve DNS explicitly, validate each address.
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .inspect_err(|_| {
+            let _ = uds.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        })?
+        .collect();
+
+    // Find a safe address to connect to.
+    let safe_addr = addrs.iter().find(|a| is_safe_resolved_ip(&a.ip()));
+
+    let Some(&target_addr) = safe_addr else {
+        let _ = uds.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("all resolved IPs for {host}:{port} are in denied ranges"),
+        ));
+    };
+
+    let tcp = match TcpStream::connect_timeout(&target_addr, CONNECT_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = uds.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            return Err(e);
+        }
+    };
+
+    uds.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+
+    // Clear the handshake timeout before entering relay.
+    uds.set_read_timeout(None)?;
+    relay_connected(uds, tcp, IDLE_TIMEOUT)
+}
+
+/// Apply a minimal seccomp filter for the CONNECT proxy process.
+///
+/// Broader than the bridge relay filter because the proxy must make
+/// outbound TCP connections and resolve DNS (glibc getaddrinfo → NSS
+/// → dlopen). Runs outside the sandbox on the host network.
+///
+/// # Preconditions
+///
+/// The `UnixListener` must already be bound and listening before this
+/// function is called (`listen` is not in the allowlist). NSS must be
+/// pre-initialized via a dummy DNS resolution before this function is
+/// called (`mprotect(PROT_EXEC)` is denied).
+#[cfg(seccomp_supported)]
+pub fn apply_connect_proxy_seccomp() -> crate::Result<()> {
+    let (clone3_prog, main_prog) = build_connect_proxy_filters()?;
+
+    seccompiler::apply_filter(&clone3_prog)
+        .map_err(|e| crate::Error::Seccomp(format!("install clone3 filter: {e}")))?;
+
+    seccompiler::apply_filter(&main_prog)
+        .map_err(|e| crate::Error::Seccomp(format!("install connect proxy filter: {e}")))?;
+
+    log::info!("connect proxy seccomp: filter applied");
+    Ok(())
+}
+
+#[cfg(seccomp_supported)]
+fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)>
+{
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
+    use std::collections::HashMap;
+
+    let arch = crate::seccomp::target_arch()?;
+
+    let mut allow: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+
+    // I/O: accept, connect, relay, shutdown.
+    for nr in [
+        libc::SYS_accept4,
+        libc::SYS_connect,
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_writev,
+        libc::SYS_recvfrom,
+        libc::SYS_sendto,
+        libc::SYS_close,
+        libc::SYS_shutdown,
+        libc::SYS_ppoll,
+        libc::SYS_epoll_pwait,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_create1,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+    #[cfg(target_arch = "x86_64")]
+    for nr in [libc::SYS_poll, libc::SYS_epoll_wait] {
+        allow.insert(nr, vec![]);
+    }
+
+    // DNS resolution.
+    for nr in [
+        libc::SYS_sendmmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_bind,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // NSS file I/O.
+    for nr in [
+        libc::SYS_openat,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_lseek,
+        libc::SYS_pread64,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Thread management.
+    for nr in [
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_sched_yield,
+        libc::SYS_gettid,
+        libc::SYS_getpid,
+        libc::SYS_tgkill,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // clone: require thread-creation flags.
+    let clone_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(CLONE_THREAD_FLAGS),
+            CLONE_THREAD_FLAGS,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("clone condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("clone rule: {e}")))?;
+    allow.insert(libc::SYS_clone, vec![clone_rule]);
+
+    // clone3: must be in main filter for stacked ENOSYS to win.
+    allow.insert(libc::SYS_clone3, vec![]);
+
+    // Memory management.
+    for nr in [
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // mprotect: deny PROT_EXEC (NSS must be pre-initialized).
+    let mprotect_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
+            0,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("mprotect condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("mprotect rule: {e}")))?;
+    allow.insert(libc::SYS_mprotect, vec![mprotect_rule]);
+
+    // Signals.
+    for nr in [
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Process lifecycle.
+    for nr in [libc::SYS_exit, libc::SYS_exit_group] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Socket: restrict to AF_UNIX + AF_INET + AF_INET6 only.
+    // Blocks AF_NETLINK (routing manipulation) and AF_PACKET
+    // (packet capture) if the proxy process is compromised.
+    let socket_unix = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_UNIX as u64,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("socket AF_UNIX condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("socket AF_UNIX rule: {e}")))?;
+    let socket_inet = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_INET as u64,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("socket AF_INET condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("socket AF_INET rule: {e}")))?;
+    let socket_inet6 = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_INET6 as u64,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("socket AF_INET6 condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("socket AF_INET6 rule: {e}")))?;
+    allow.insert(
+        libc::SYS_socket,
+        vec![socket_unix, socket_inet, socket_inet6],
+    );
+
+    // Misc (glibc/Rust runtime + NSS).
+    for nr in [
+        libc::SYS_getrandom,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_nanosleep,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_fcntl,
+        libc::SYS_prlimit64,
+        libc::SYS_rseq,
+        libc::SYS_getuid,
+        libc::SYS_getgid,
+        libc::SYS_geteuid,
+        libc::SYS_getegid,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // clone3 ENOSYS filter (same pattern as bridge).
+    let mut clone3_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    clone3_deny.insert(libc::SYS_clone3, vec![]);
+
+    let clone3_filter = SeccompFilter::new(
+        clone3_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| crate::Error::Seccomp(format!("build clone3 filter: {e}")))?;
+
+    let clone3_prog: seccompiler::BpfProgram =
+        clone3_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                crate::Error::Seccomp(format!("compile clone3 filter: {e}"))
+            })?;
+
+    // Main allowlist (default KillProcess).
+    let filter = SeccompFilter::new(
+        allow.into_iter().collect(),
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        arch,
+    )
+    .map_err(|e| crate::Error::Seccomp(format!("build connect proxy filter: {e}")))?;
+
+    let main_prog = filter.try_into().map_err(|e: seccompiler::BackendError| {
+        crate::Error::Seccomp(format!("compile connect proxy filter: {e}"))
+    })?;
+
+    Ok((clone3_prog, main_prog))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +1221,230 @@ mod tests {
         // to break the accept loop.
         std::thread::sleep(Duration::from_millis(100));
         drop(accept_handle);
+    }
+
+    // ─── CONNECT proxy tests ─────────────────────────────────
+
+    fn make_connect_request(target: &str, version: &str) -> Vec<u8> {
+        format!("CONNECT {target} {version}\r\n\r\n").into_bytes()
+    }
+
+    fn make_connect_with_headers(target: &str, headers: &str) -> Vec<u8> {
+        format!("CONNECT {target} HTTP/1.1\r\n{headers}\r\n").into_bytes()
+    }
+
+    #[test]
+    fn parse_connect_valid() {
+        let data = make_connect_request("api.example.com:443", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        let (host, port) = parse_connect_request(&mut cursor).unwrap();
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_connect_lowercase_host() {
+        let data = make_connect_request("API.EXAMPLE.COM:443", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        let (host, _) = parse_connect_request(&mut cursor).unwrap();
+        assert_eq!(host, "api.example.com");
+    }
+
+    #[test]
+    fn parse_connect_minimal() {
+        let data = b"CONNECT host:8080 HTTP/1.0\r\n\r\n";
+        let mut cursor = io::Cursor::new(&data[..]);
+        let (host, port) = parse_connect_request(&mut cursor).unwrap();
+        assert_eq!(host, "host");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_connect_with_headers_ignores_host() {
+        let data = make_connect_with_headers(
+            "allowed.com:443",
+            "Host: evil.com:443\r\nProxy-Authorization: Basic abc\r\n",
+        );
+        let mut cursor = io::Cursor::new(data);
+        let (host, port) = parse_connect_request(&mut cursor).unwrap();
+        assert_eq!(host, "allowed.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_connect_wrong_method() {
+        let data = b"GET / HTTP/1.1\r\n\r\n";
+        let mut cursor = io::Cursor::new(&data[..]);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_bad_http_version() {
+        let data = make_connect_request("host:443", "HTTP/9.9");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_missing_port() {
+        let data = make_connect_request("host", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_port_zero() {
+        let data = make_connect_request("host:0", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_port_overflow() {
+        let data = make_connect_request("host:65536", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_port_nonnumeric() {
+        let data = make_connect_request("host:abc", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_oversized() {
+        let mut data = b"CONNECT host:443 HTTP/1.1\r\n".to_vec();
+        data.extend(vec![b'X'; MAX_CONNECT_REQUEST + 100]);
+        data.extend(b"\r\n\r\n");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_ipv6_brackets_rejected() {
+        let data = make_connect_request("[::1]:443", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_trailing_dot_stripped() {
+        let data = make_connect_request("api.example.com.:443", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        let (host, port) = parse_connect_request(&mut cursor).unwrap();
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn validate_ip_rejects_loopback() {
+        assert!(!is_safe_resolved_ip(&"127.0.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"127.255.255.255".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_rfc1918() {
+        assert!(!is_safe_resolved_ip(&"10.0.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"172.16.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_link_local() {
+        assert!(!is_safe_resolved_ip(&"169.254.169.254".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"169.254.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_ipv4_mapped_loopback() {
+        assert!(!is_safe_resolved_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_ipv4_mapped_rfc1918() {
+        assert!(!is_safe_resolved_ip(&"::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"::ffff:192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_unique_local() {
+        assert!(!is_safe_resolved_ip(&"fc00::1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"fd12:3456::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_allows_public() {
+        assert!(is_safe_resolved_ip(&"1.1.1.1".parse().unwrap()));
+        assert!(is_safe_resolved_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(is_safe_resolved_ip(
+            &"2607:f8b0:4004:800::200e".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn parse_connect_empty_host_rejected() {
+        let data = make_connect_request(":443", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_consecutive_dots_rejected() {
+        let data = make_connect_request("host..com:443", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_connect_port_max_accepted() {
+        let data = make_connect_request("host:65535", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        let (_, port) = parse_connect_request(&mut cursor).unwrap();
+        assert_eq!(port, 65535);
+    }
+
+    #[test]
+    fn parse_connect_negative_port_rejected() {
+        let data = make_connect_request("host:-1", "HTTP/1.1");
+        let mut cursor = io::Cursor::new(data);
+        assert!(parse_connect_request(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn validate_ip_rejects_unspecified() {
+        assert!(!is_safe_resolved_ip(&"0.0.0.0".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"::".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_this_network() {
+        assert!(!is_safe_resolved_ip(&"0.0.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"0.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_cgnat() {
+        assert!(!is_safe_resolved_ip(&"100.64.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"100.127.255.254".parse().unwrap()));
+        // Just outside CGNAT range — should pass.
+        assert!(is_safe_resolved_ip(&"100.63.255.255".parse().unwrap()));
+        assert!(is_safe_resolved_ip(&"100.128.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_benchmarking() {
+        assert!(!is_safe_resolved_ip(&"198.18.0.1".parse().unwrap()));
+        assert!(!is_safe_resolved_ip(&"198.19.255.255".parse().unwrap()));
+    }
+
+    #[cfg(seccomp_supported)]
+    #[test]
+    fn connect_proxy_seccomp_filters_build() {
+        let (clone3_prog, main_prog) = build_connect_proxy_filters().unwrap();
+        assert!(!clone3_prog.is_empty());
+        assert!(!main_prog.is_empty());
     }
 }
