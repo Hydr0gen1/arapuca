@@ -261,6 +261,8 @@ fn run_subcommand(args: &[String]) {
     let mut cpus: Option<u32> = None;
     let mut pids: Option<u32> = None;
     let mut task_id: Option<String> = None;
+    #[cfg(target_os = "linux")]
+    let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -281,6 +283,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --cpus N           CPU limit (percentage, 200 = 2 cores)");
             eprintln!("  --pids N           max number of PIDs");
             eprintln!("  --task-id NAME     identifier for cgroup and audit");
+            eprintln!("  --allow-host H:P   allow HTTPS to host:port (repeatable)");
             if sep_pos.is_none() && !args.is_empty() {
                 eprintln!();
                 eprintln!("hint: did you forget '--' before the command?");
@@ -418,6 +421,24 @@ fn run_subcommand(args: &[String]) {
                         .clone(),
                 );
             }
+            "--allow-host" => {
+                i += 1;
+                let spec = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--allow-host requires host:port");
+                    std::process::exit(125);
+                });
+                #[cfg(target_os = "linux")]
+                {
+                    let (host, port) = parse_allow_host(spec);
+                    allowed_hosts.push(arapuca::bridge::AllowedHost { host, port });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = spec;
+                    eprintln!("arapuca run: --allow-host requires Linux (network namespaces)");
+                    std::process::exit(125);
+                }
+            }
             other => {
                 eprintln!("arapuca run: unknown flag: {other}");
                 eprintln!("hint: did you forget '--' before the command?");
@@ -426,6 +447,18 @@ fn run_subcommand(args: &[String]) {
         }
         i += 1;
     }
+
+    // ── CONNECT proxy for --allow-host ────────────────────────
+    #[cfg(target_os = "linux")]
+    let (connect_proxy_socket, connect_proxy_pid, connect_proxy_pidfd) =
+        if !allowed_hosts.is_empty() {
+            let (path, pid, pidfd) = fork_connect_proxy(&allowed_hosts);
+            (Some(path), Some(pid), Some(pidfd))
+        } else {
+            (None, None, None)
+        };
+    #[cfg(not(target_os = "linux"))]
+    let connect_proxy_socket: Option<PathBuf> = None;
 
     // Merge default paths with user-specified paths.
     let (mut default_read, mut default_write) = arapuca::env::default_sandbox_paths();
@@ -457,7 +490,7 @@ fn run_subcommand(args: &[String]) {
         max_cpu_pct: cpus.unwrap_or(0),
         max_pids: pids.unwrap_or(0),
         allow_exec: true,
-        use_netns: false,
+        use_netns: connect_proxy_socket.is_some(),
         ..Default::default()
     };
 
@@ -475,7 +508,7 @@ fn run_subcommand(args: &[String]) {
         stderr: None,
         #[cfg(unix)]
         extra_fds: Vec::new(),
-        network_proxy_socket: None,
+        network_proxy_socket: connect_proxy_socket.clone(),
         env: user_env,
         audit_sink: None,
         audit_verbosity: arapuca::audit::AuditVerbosity::Standard,
@@ -494,6 +527,12 @@ fn run_subcommand(args: &[String]) {
     let mut process = match sandbox.launch(&config, cmd, &cmd_rest) {
         Ok(p) => p,
         Err(e) => {
+            #[cfg(target_os = "linux")]
+            cleanup_connect_proxy(
+                connect_proxy_pid,
+                connect_proxy_pidfd,
+                &connect_proxy_socket,
+            );
             eprintln!("arapuca run: launch failed: {e}");
             std::process::exit(125);
         }
@@ -560,7 +599,67 @@ fn run_subcommand(args: &[String]) {
     };
 
     process.cleanup();
+
+    #[cfg(target_os = "linux")]
+    cleanup_connect_proxy(
+        connect_proxy_pid,
+        connect_proxy_pidfd,
+        &connect_proxy_socket,
+    );
+
     std::process::exit(exit_code);
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_connect_proxy(pid: Option<i32>, pidfd: Option<i32>, socket: &Option<PathBuf>) {
+    // Send SIGKILL via pidfd (race-free) or fall back to kill().
+    // Without this fallback, waitpid blocks forever if pidfd_open
+    // failed (kernel < 5.3, EMFILE, etc.).
+    let sent_via_pidfd = if let Some(fd) = pidfd {
+        if fd >= 0 {
+            // SAFETY: pidfd_send_signal with valid pidfd.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !sent_via_pidfd {
+        if let Some(pid) = pid {
+            // SAFETY: kill with valid pid.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    if let Some(pid) = pid {
+        // SAFETY: waitpid with valid pid. Retry on EINTR.
+        loop {
+            let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            if ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+    }
+    if let Some(fd) = pidfd {
+        if fd >= 0 {
+            // SAFETY: close valid pidfd.
+            unsafe { libc::close(fd) };
+        }
+    }
+    if let Some(sock) = socket {
+        if let Some(parent) = sock.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
 }
 
 fn parse_volume_spec(spec: &str) -> (PathBuf, bool) {
@@ -610,6 +709,223 @@ fn signal_child(sig: libc::c_int) {
         // SAFETY: kill with valid pid and signal.
         unsafe { libc::kill(pid, sig) };
     }
+}
+
+// ─── --allow-host support ─────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn parse_allow_host(spec: &str) -> (String, u16) {
+    let (host, port_str) = match spec.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, p),
+        _ => {
+            eprintln!("arapuca run: invalid --allow-host: {spec} (expected host:port)");
+            std::process::exit(125);
+        }
+    };
+
+    // Strip trailing dot (FQDN normalization).
+    let host = host.strip_suffix('.').unwrap_or(host);
+
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        eprintln!("arapuca run: invalid hostname in --allow-host: {host}");
+        std::process::exit(125);
+    }
+
+    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        eprintln!("arapuca run: invalid hostname in --allow-host: {host}");
+        std::process::exit(125);
+    }
+
+    let port: u16 = match port_str.parse() {
+        Ok(0) => {
+            eprintln!("arapuca run: --allow-host port must be 1-65535");
+            std::process::exit(125);
+        }
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("arapuca run: invalid port in --allow-host: {port_str}");
+            std::process::exit(125);
+        }
+    };
+
+    (host.to_ascii_lowercase(), port)
+}
+
+#[cfg(target_os = "linux")]
+fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBuf, i32, i32) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let proxy_dir = tempfile::Builder::new()
+        .prefix("arapuca-connect-proxy-")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap_or_else(|e| {
+            eprintln!("arapuca run: proxy tmpdir: {e}");
+            std::process::exit(125);
+        });
+    let uds_path = proxy_dir.keep().join("connect.sock");
+
+    let listener = UnixListener::bind(&uds_path).unwrap_or_else(|e| {
+        eprintln!("arapuca run: proxy bind {}: {e}", uds_path.display());
+        std::process::exit(125);
+    });
+
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 with valid array and O_CLOEXEC.
+    let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret != 0 {
+        eprintln!(
+            "arapuca run: proxy pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(125);
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+
+    // SAFETY: getpid is always safe.
+    let parent_pid = unsafe { libc::getpid() };
+
+    let hosts = allowed_hosts.to_vec();
+    let listener_fd = listener.as_raw_fd();
+
+    // SAFETY: single-threaded at this point (before sandbox.launch).
+    let child_pid = unsafe { libc::fork() };
+
+    if child_pid < 0 {
+        eprintln!(
+            "arapuca run: proxy fork: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(125);
+    }
+
+    if child_pid == 0 {
+        // ── CONNECT proxy child ──────────────────────────────
+
+        // SAFETY: pipe_read is a valid fd from pipe2.
+        unsafe { libc::close(pipe_read) };
+
+        // Close all FDs >= 3 except pipe_write and listener_fd.
+        // SAFETY: close_range with valid fd ranges.
+        unsafe {
+            let mut keep = [pipe_write, listener_fd];
+            keep.sort();
+            let mut start = 3i32;
+            for &fd in &keep {
+                if fd > start {
+                    libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
+                }
+                start = fd + 1;
+            }
+            libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
+        }
+
+        // setsid clears PR_SET_PDEATHSIG, so pdeathsig must be re-set
+        // after. The getppid race check below covers the window between
+        // setsid and prctl. This differs from the bridge fork (which
+        // omits setsid) because the CONNECT proxy is a session leader.
+        // SAFETY: setsid is always safe.
+        unsafe { libc::setsid() };
+
+        // SAFETY: prctl with PR_SET_PDEATHSIG.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+
+        // Race check.
+        // SAFETY: getppid is always safe.
+        if unsafe { libc::getppid() } != parent_pid {
+            unsafe { libc::_exit(1) };
+        }
+
+        // SAFETY: prctl with PR_SET_NO_NEW_PRIVS.
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) };
+
+        // SAFETY: prctl with PR_SET_DUMPABLE.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+
+        // Pre-initialize NSS before seccomp — forces dlopen of all
+        // NSS modules. Using an unresolvable FQDN traverses the
+        // entire nsswitch hosts chain (files, mymachines, resolve,
+        // dns, etc.). NO_NEW_PRIVS does not affect mprotect — only
+        // seccomp blocks PROT_EXEC, which is why this must happen
+        // before seccomp.
+        use std::net::ToSocketAddrs;
+        let _ = ("_arapuca-nss-init.invalid.", 0u16).to_socket_addrs();
+
+        #[cfg(seccomp_supported)]
+        if let Err(e) = arapuca::bridge::apply_connect_proxy_seccomp() {
+            eprintln!("arapuca run: proxy seccomp: {e}");
+            unsafe { libc::_exit(1) };
+        }
+
+        if let Err(e) = arapuca::bridge::connect_proxy_listen(listener, &hosts, pipe_write) {
+            eprintln!("arapuca run: proxy: {e}");
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    // ── Parent ────────────────────────────────────────────────
+
+    drop(listener);
+    // SAFETY: pipe_write is a valid fd.
+    unsafe { libc::close(pipe_write) };
+
+    // Open pidfd immediately — child PID is guaranteed valid.
+    // SAFETY: pidfd_open with valid pid.
+    let proxy_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) } as i32;
+
+    // Wait for readiness (5s timeout).
+    let mut pfd = libc::pollfd {
+        fd: pipe_read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let poll_ret = loop {
+        // SAFETY: pfd is valid, timeout in ms.
+        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+
+    // Helper: kill child + clean temp dir on error, then exit.
+    let fail_proxy = |msg: &str| -> ! {
+        eprintln!("arapuca run: {msg}");
+        // SAFETY: child_pid is valid.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
+        std::process::exit(125);
+    };
+
+    if poll_ret == 0 {
+        fail_proxy("proxy readiness timeout (5s)");
+    }
+    if poll_ret < 0 {
+        fail_proxy(&format!("proxy poll: {}", std::io::Error::last_os_error()));
+    }
+
+    let mut buf = [0u8; 1];
+    let n = loop {
+        // SAFETY: pipe_read is valid.
+        let ret =
+            unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+    // SAFETY: done with pipe_read.
+    unsafe { libc::close(pipe_read) };
+
+    if n != 1 {
+        fail_proxy("proxy readiness signal failed");
+    }
+
+    (uds_path, child_pid, proxy_pidfd)
 }
 
 // ─── Image subcommands ─────────────────────────────────────────
