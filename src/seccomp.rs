@@ -801,4 +801,89 @@ mod tests {
         assert!(!exited, "lsm_get_self_attr should be killed");
         assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
     }
+
+    #[test]
+    fn tier1_lsm_list_modules_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: raw syscall with invalid args — filter kills before kernel processes.
+            // x86_64/aarch64: __NR_lsm_list_modules = 461
+            unsafe { libc::syscall(SYS_LSM_LIST_MODULES, 0u64, 0u64, 0u64) };
+        });
+        assert!(!exited, "lsm_list_modules should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn prctl_pdeathsig_zero_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
+            if ret == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "PR_SET_PDEATHSIG=0 should return EPERM");
+    }
+
+    #[test]
+    fn prctl_set_dumpable_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1) };
+            if ret == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "PR_SET_DUMPABLE=1 should return EPERM");
+    }
+
+    #[test]
+    fn prctl_pdeathsig_sigkill_allowed() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            if ret == 0 {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "PR_SET_PDEATHSIG=SIGKILL should succeed");
+    }
+
+    #[test]
+    fn prctl_set_dumpable_zero_allowed() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+            if ret == 0 {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "PR_SET_DUMPABLE=0 should succeed");
+    }
+
+    #[test]
+    fn tier2_socket_inet6_eperm() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "AF_INET6 socket should return EPERM");
+    }
 }
