@@ -372,6 +372,8 @@ pub fn bridge_env(
 ///   to `/proc/self/fd/*`, re-opening the `/proc` exposure after
 ///   `canonicalize_paths()` resolves them
 /// - `/dev/pts` — hierarchical access to all host pseudo-terminals
+/// - `/dev/tty` — canonicalizes to the parent's `/dev/pts/N`,
+///   granting Landlock read access to the parent's terminal device
 ///
 /// Paths are NOT canonicalized here — the caller handles that after
 /// merging with user-specified `-v` paths.
@@ -402,7 +404,6 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         PathBuf::from("/dev/zero"),
         PathBuf::from("/dev/urandom"),
         PathBuf::from("/dev/random"),
-        PathBuf::from("/dev/tty"),
     ];
     let write = vec![PathBuf::from("/tmp")];
     (read, write)
@@ -886,6 +887,12 @@ mod tests {
         assert!(
             !all.contains(&Path::new("/dev/pts")),
             "must not include /dev/pts"
+        );
+
+        // /dev/tty canonicalizes to parent's /dev/pts/N.
+        assert!(
+            !all.contains(&Path::new("/dev/tty")),
+            "must not include /dev/tty"
         );
     }
 
