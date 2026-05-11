@@ -195,4 +195,180 @@ mod tests {
         let fds: Vec<RawFd> = (3..3 + MAX_EXTRA_FDS as i32).collect();
         assert!(validate_extra_fds(&fds, &test_config()).is_ok());
     }
+
+    // ── remap_fds tests ───────────────────────────────────────────
+    //
+    // remap_fds overwrites FDs 3, 4, ... in the calling process, so
+    // these tests fork a child to isolate the FD table. The child
+    // calls remap_fds, reads from the remapped targets, and reports
+    // success via _exit(42) or failure via _exit(1).
+
+    fn make_pipe() -> (RawFd, RawFd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    fn run_remap_test(test_fn: fn()) -> (bool, i32) {
+        // SAFETY: fork is safe in single-threaded test context.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            test_fn();
+            unsafe { libc::_exit(0) };
+        }
+        let mut status: libc::c_int = 0;
+        assert!(unsafe { libc::waitpid(pid, &mut status, 0) } > 0);
+        if libc::WIFEXITED(status) {
+            (true, libc::WEXITSTATUS(status))
+        } else {
+            (false, libc::WTERMSIG(status))
+        }
+    }
+
+    #[test]
+    fn remap_high_fds() {
+        let (exited, code) = run_remap_test(|| {
+            let (r1, w1) = make_pipe();
+            let (r2, w2) = make_pipe();
+            unsafe { libc::write(w1, b"AA".as_ptr().cast(), 2) };
+            unsafe { libc::write(w2, b"BB".as_ptr().cast(), 2) };
+            unsafe { libc::close(w1) };
+            unsafe { libc::close(w2) };
+
+            let mut fds = std::mem::ManuallyDrop::new(vec![r1, r2]);
+            if unsafe { remap_fds(&mut fds) }.is_err() {
+                unsafe { libc::_exit(1) };
+            }
+
+            let mut buf = [0u8; 2];
+            if unsafe { libc::read(3, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"AA" {
+                unsafe { libc::_exit(1) };
+            }
+            if unsafe { libc::read(4, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"BB" {
+                unsafe { libc::_exit(1) };
+            }
+            unsafe { libc::_exit(42) };
+        });
+        assert!(exited);
+        assert_eq!(code, 42, "remap of high FDs failed");
+    }
+
+    #[test]
+    fn remap_source_in_target_range() {
+        let (exited, code) = run_remap_test(|| {
+            // Close FDs 3-6 in the child so pipe() allocates them.
+            for fd in 3..=6 {
+                unsafe { libc::close(fd) };
+            }
+            // pipe() returns the lowest available FDs: (3,4) and (5,6).
+            let (r1, w1) = make_pipe(); // r1=3, w1=4
+            let (r2, w2) = make_pipe(); // r2=5, w2=6
+            unsafe { libc::write(w1, b"XX".as_ptr().cast(), 2) };
+            unsafe { libc::write(w2, b"YY".as_ptr().cast(), 2) };
+            unsafe { libc::close(w1) };
+            unsafe { libc::close(w2) };
+
+            // r1=3, r2=5. For a 2-element remap, target range is [3,5).
+            // FD 3 is in range and must be evacuated. FD 5 is not.
+            let mut fds = std::mem::ManuallyDrop::new(vec![r1, r2]);
+            if unsafe { remap_fds(&mut fds) }.is_err() {
+                unsafe { libc::_exit(1) };
+            }
+
+            let mut buf = [0u8; 2];
+            if unsafe { libc::read(3, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"XX" {
+                unsafe { libc::_exit(2) };
+            }
+            if unsafe { libc::read(4, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"YY" {
+                unsafe { libc::_exit(3) };
+            }
+            unsafe { libc::_exit(42) };
+        });
+        assert!(exited);
+        assert_eq!(code, 42, "remap with source in target range failed");
+    }
+
+    #[test]
+    fn remap_swap() {
+        let (exited, code) = run_remap_test(|| {
+            // Close FDs 3-6 so pipe() allocates them predictably.
+            for fd in 3..=6 {
+                unsafe { libc::close(fd) };
+            }
+            let (r1, w1) = make_pipe(); // r1=3, w1=4
+            let (r2, w2) = make_pipe(); // r2=5, w2=6
+            unsafe { libc::write(w1, b"11".as_ptr().cast(), 2) };
+            unsafe { libc::write(w2, b"22".as_ptr().cast(), 2) };
+            unsafe { libc::close(w1) };
+            unsafe { libc::close(w2) };
+
+            // Swap: place r2 (data "22") at FD 3, r1 (data "11") at FD 4.
+            // For a 2-element remap, fds[0]->target 3, fds[1]->target 4.
+            // r2=5, r1=3. fds=[5, 3]: target 3 gets r2's data ("22"),
+            // target 4 gets r1's data ("11"). FD 3 is in range [3,5)
+            // and must be evacuated.
+            let mut fds = std::mem::ManuallyDrop::new(vec![r2, r1]);
+            if unsafe { remap_fds(&mut fds) }.is_err() {
+                unsafe { libc::_exit(1) };
+            }
+
+            let mut buf = [0u8; 2];
+            if unsafe { libc::read(3, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"22" {
+                unsafe { libc::_exit(2) };
+            }
+            if unsafe { libc::read(4, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"11" {
+                unsafe { libc::_exit(3) };
+            }
+            unsafe { libc::_exit(42) };
+        });
+        assert!(exited);
+        assert_eq!(code, 42, "remap swap failed");
+    }
+
+    #[test]
+    fn remap_single_fd() {
+        let (exited, code) = run_remap_test(|| {
+            let (r, w) = make_pipe();
+            unsafe { libc::write(w, b"OK".as_ptr().cast(), 2) };
+            unsafe { libc::close(w) };
+
+            let mut fds = std::mem::ManuallyDrop::new(vec![r]);
+            if unsafe { remap_fds(&mut fds) }.is_err() {
+                unsafe { libc::_exit(1) };
+            }
+
+            let mut buf = [0u8; 2];
+            if unsafe { libc::read(3, buf.as_mut_ptr().cast(), 2) } != 2 || &buf != b"OK" {
+                unsafe { libc::_exit(1) };
+            }
+            unsafe { libc::_exit(42) };
+        });
+        assert!(exited);
+        assert_eq!(code, 42, "remap single FD failed");
+    }
+
+    #[test]
+    fn remap_clears_cloexec() {
+        let (exited, code) = run_remap_test(|| {
+            let (r, w) = make_pipe();
+            // Set CLOEXEC on the read end.
+            unsafe { libc::fcntl(r, libc::F_SETFD, libc::FD_CLOEXEC) };
+            unsafe { libc::write(w, b"CE".as_ptr().cast(), 2) };
+            unsafe { libc::close(w) };
+
+            let mut fds = std::mem::ManuallyDrop::new(vec![r]);
+            if unsafe { remap_fds(&mut fds) }.is_err() {
+                unsafe { libc::_exit(1) };
+            }
+
+            let flags = unsafe { libc::fcntl(3, libc::F_GETFD) };
+            if flags == -1 || (flags & libc::FD_CLOEXEC) != 0 {
+                unsafe { libc::_exit(1) };
+            }
+            unsafe { libc::_exit(42) };
+        });
+        assert!(exited);
+        assert_eq!(code, 42, "CLOEXEC should be cleared after remap");
+    }
 }
