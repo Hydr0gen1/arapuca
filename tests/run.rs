@@ -356,3 +356,111 @@ fn env_without_value_rejected() {
         .unwrap();
     assert_eq!(status.code(), Some(125));
 }
+
+// ─── --allow-host tests ──────────────────────────────────────
+
+#[test]
+fn allow_host_invalid_format_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "noport", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn allow_host_port_zero_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "host:0", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn allow_host_invalid_hostname_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "bad host:443", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn allow_host_consecutive_dots_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "host..com:443", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn allow_host_port_overflow_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--allow-host", "host:65536", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+}
+
+#[test]
+fn no_allow_host_does_not_set_proxy() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo proxy=${HTTPS_PROXY:-unset}",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("proxy=unset"),
+        "HTTPS_PROXY should not be set without --allow-host: {stdout}"
+    );
+}
+
+fn netns_available() -> bool {
+    Command::new("unshare")
+        .args(["--user", "--net", "--map-current-user", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[test]
+fn allow_host_sets_https_proxy() {
+    if !netns_available() {
+        eprintln!("skipping: netns not available");
+        return;
+    }
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-host",
+            "example.com:443",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo proxy=${HTTPS_PROXY:-unset}",
+        ])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("loopback") || stderr.contains("Operation not permitted") {
+            eprintln!("skipping: netns not functional: {stderr}");
+            return;
+        }
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:"),
+        "HTTPS_PROXY should be set with --allow-host: {stdout}"
+    );
+}
