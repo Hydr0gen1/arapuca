@@ -337,6 +337,9 @@ impl Sandbox for Linux {
             let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
             if ret == 0 {
                 let target_fd = 3 + fds_to_inherit.len() as i32;
+                // Bypasses validate_extra_fds intentionally: pipe2 returns
+                // the lowest unused FDs, so the write-end cannot collide
+                // with any already-open user FD in fds_to_inherit.
                 fds_to_inherit.push(fds[1]);
                 Some((fds[0], fds[1], target_fd))
             } else {

@@ -252,6 +252,7 @@ fn build_filter() -> crate::Result<BpfProgram> {
 
 // LSM syscalls (kernel 6.8+, generic table — same NR on x86_64/aarch64).
 // Not yet in the libc crate for these architectures.
+// TODO: replace with libc::SYS_lsm_* when the libc crate adds them.
 // Reference: include/uapi/asm-generic/unistd.h
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const SYS_LSM_GET_SELF_ATTR: i64 = 459;
