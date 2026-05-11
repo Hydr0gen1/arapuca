@@ -573,3 +573,91 @@ fn seccomp_baseline_includes_proc_sys() {
         "baseline should grant /proc access: {stdout}"
     );
 }
+
+#[test]
+fn seccomp_strict_blocks_network_socket() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "strict",
+            "--",
+            "/bin/sh",
+            "-c",
+            "python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)' 2>&1; echo exit=$?",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("Operation not permitted")
+            || combined.contains("EPERM")
+            || combined.contains("exit=1"),
+        "strict should block AF_INET: {combined}"
+    );
+}
+
+#[test]
+fn seccomp_baseline_allows_network_socket() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "baseline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); print(\"INET_OK\")' 2>&1",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("INET_OK"),
+        "baseline should allow AF_INET: {stdout}"
+    );
+}
+
+#[test]
+fn seccomp_baseline_blocks_ptrace() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "baseline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "strace -e trace=none /bin/true 2>&1; echo exit=$?",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("exit=159") || stdout.contains("exit=137"),
+        "baseline should block ptrace (strace): {stdout}"
+    );
+}
+
+#[test]
+fn seccomp_strict_blocks_proc_read() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "strict",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /proc/self/cgroup 2>&1 && echo proc_ok || echo proc_fail",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("proc_fail") || stdout.contains("Permission denied"),
+        "strict should block /proc reads: {stdout}"
+    );
+}
