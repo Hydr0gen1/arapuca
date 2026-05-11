@@ -351,6 +351,81 @@ pub fn bridge_env(
     )))
 }
 
+/// Per-platform default read and write paths for `arapuca run`.
+///
+/// Returns `(read_paths, write_paths)` with the minimal filesystem
+/// access a sandboxed process needs to function. Follows the container
+/// runtime model: curated specific entries, not blanket virtual
+/// filesystem trees.
+///
+/// # Security
+///
+/// These defaults define the sandbox attack surface. Adding paths here
+/// expands what a sandboxed process can access.
+///
+/// `/proc`, `/sys`, and blanket `/dev` are deliberately excluded:
+/// - `/proc` — exposes host process info, environ, ASLR layout
+/// - `/sys` — Landlock is hierarchical, so `/sys` transitively
+///   grants `/sys/fs/cgroup/**` read (cgroup path invariant)
+/// - `/dev` (blanket) — exposes `/dev/shm`, `/dev/kmsg`
+/// - `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` — symlinks
+///   to `/proc/self/fd/*`, re-opening the `/proc` exposure after
+///   `canonicalize_paths()` resolves them
+/// - `/dev/pts` — hierarchical access to all host pseudo-terminals
+///
+/// Paths are NOT canonicalized here — the caller handles that after
+/// merging with user-specified `-v` paths.
+#[cfg(target_os = "linux")]
+pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let read = vec![
+        // System binaries and libraries.
+        PathBuf::from("/usr"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/sbin"),
+        // TLS certificates.
+        PathBuf::from("/etc/ssl"),
+        PathBuf::from("/etc/pki"),
+        PathBuf::from("/etc/ca-certificates"),
+        // Name resolution and dynamic linking.
+        PathBuf::from("/etc/resolv.conf"),
+        PathBuf::from("/etc/hosts"),
+        PathBuf::from("/etc/nsswitch.conf"),
+        PathBuf::from("/etc/ld.so.cache"),
+        // Locale and user info.
+        PathBuf::from("/etc/localtime"),
+        PathBuf::from("/etc/passwd"),
+        PathBuf::from("/etc/group"),
+        // Device nodes (curated, not blanket /dev).
+        PathBuf::from("/dev/null"),
+        PathBuf::from("/dev/zero"),
+        PathBuf::from("/dev/urandom"),
+        PathBuf::from("/dev/random"),
+        PathBuf::from("/dev/tty"),
+    ];
+    let write = vec![PathBuf::from("/tmp")];
+    (read, write)
+}
+
+/// macOS: Seatbelt profile handles system paths. Only /tmp as writable.
+#[cfg(target_os = "macos")]
+pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    (Vec::new(), vec![PathBuf::from("/tmp")])
+}
+
+/// Windows: AppContainer handles system DLL access.
+#[cfg(target_os = "windows")]
+pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    (Vec::new(), vec![std::env::temp_dir()])
+}
+
+/// Fallback for unsupported platforms.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    (Vec::new(), vec![PathBuf::from("/tmp")])
+}
+
 /// Create a temporary directory with a random suffix.
 ///
 /// Uses the `tempfile` crate which calls `mkdtemp` on Unix (mode 0700,
@@ -753,5 +828,78 @@ mod tests {
         let result = filter_caller_env(&env);
         assert!(result.passed.is_empty());
         assert_eq!(result.dropped[0].reason, DropReason::RuntimeInjection);
+    }
+
+    #[test]
+    fn default_sandbox_paths_has_write_paths() {
+        let (_read, write) = default_sandbox_paths();
+        assert!(!write.is_empty(), "write paths should include temp dir");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_sandbox_paths_linux_includes_system() {
+        let (read, write) = default_sandbox_paths();
+        assert!(read.iter().any(|p| p == Path::new("/usr")));
+        assert!(read.iter().any(|p| p == Path::new("/bin")));
+        assert!(read.iter().any(|p| p == Path::new("/dev/null")));
+        assert!(write.iter().any(|p| p == Path::new("/tmp")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_sandbox_paths_linux_excludes_virtual_fs() {
+        let (read, write) = default_sandbox_paths();
+        let all: Vec<&Path> = read
+            .iter()
+            .chain(write.iter())
+            .map(|p| p.as_path())
+            .collect();
+
+        // Blanket /proc, /sys, /dev must not be present.
+        assert!(!all.contains(&Path::new("/proc")), "must not include /proc");
+        assert!(!all.contains(&Path::new("/sys")), "must not include /sys");
+        assert!(
+            !all.contains(&Path::new("/dev")),
+            "must not include blanket /dev"
+        );
+
+        // Symlinks into /proc must not be present.
+        assert!(
+            !all.contains(&Path::new("/dev/fd")),
+            "must not include /dev/fd (symlink to /proc/self/fd)"
+        );
+        assert!(
+            !all.contains(&Path::new("/dev/stdin")),
+            "must not include /dev/stdin"
+        );
+        assert!(
+            !all.contains(&Path::new("/dev/stdout")),
+            "must not include /dev/stdout"
+        );
+        assert!(
+            !all.contains(&Path::new("/dev/stderr")),
+            "must not include /dev/stderr"
+        );
+
+        // /dev/pts grants hierarchical access to all host PTYs.
+        assert!(
+            !all.contains(&Path::new("/dev/pts")),
+            "must not include /dev/pts"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_sandbox_paths_linux_no_cgroup_ancestor() {
+        let (read, write) = default_sandbox_paths();
+        let cgroup = Path::new("/sys/fs/cgroup");
+        for p in read.iter().chain(write.iter()) {
+            assert!(
+                !cgroup.starts_with(p),
+                "path {} is an ancestor of /sys/fs/cgroup",
+                p.display()
+            );
+        }
     }
 }
