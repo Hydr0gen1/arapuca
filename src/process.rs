@@ -220,13 +220,20 @@ impl Process {
 
     /// Clean up the sandbox temp directory and cgroup.
     ///
-    /// Must only be called after `wait()` returns.
-    pub fn cleanup(self) {
+    /// Must only be called after `wait()` returns. Uses `take()` on
+    /// Option fields so the Drop impl (which runs after this method
+    /// returns) sees None and does not double-cleanup.
+    #[allow(unused_mut)]
+    pub fn cleanup(mut self) {
         #[allow(unused_mut)]
         let mut cgroup_destroyed = false;
         #[cfg(target_os = "linux")]
-        if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
-            cgroup_destroyed = mgr.destroy(path).is_ok();
+        {
+            let mgr = self.cgroup_mgr.take();
+            let path = self.cgroup_path.take();
+            if let (Some(mgr), Some(path)) = (&mgr, &path) {
+                cgroup_destroyed = mgr.destroy(path).is_ok();
+            }
         }
 
         #[cfg(windows)]
@@ -235,14 +242,15 @@ impl Process {
         let mut container_deleted = false;
         #[cfg(windows)]
         {
-            for saved in &self.saved_dacls {
+            let saved_dacls = std::mem::take(&mut self.saved_dacls);
+            for saved in &saved_dacls {
                 if let Err(e) = crate::platform::windows::restore_dacl(saved) {
                     log::warn!("failed to restore DACL: {e}");
                     dacls_restored = false;
                 }
             }
-            if let Some(ref name) = self.container_name {
-                container_deleted = crate::platform::windows::delete_app_container(name).is_ok();
+            if let Some(name) = self.container_name.take() {
+                container_deleted = crate::platform::windows::delete_app_container(&name).is_ok();
             }
         }
 
@@ -269,5 +277,78 @@ impl Process {
                 log::error!("audit emit failed: {e}");
             }
         }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Kill the child process first to ensure resources can be
+        // reclaimed. Without this, cgroups can't be destroyed while
+        // occupied, and a live process would run unsupervised after
+        // its containment is removed.
+        #[cfg(not(windows))]
+        match &mut self.child {
+            ChildHandle::Managed(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            ChildHandle::Forked(pid) if *pid > 0 => {
+                // SAFETY: kill and waitpid on a valid PID.
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+                    libc::waitpid(*pid as libc::pid_t, std::ptr::null_mut(), 0);
+                }
+            }
+            _ => {}
+        }
+
+        #[cfg(target_os = "linux")]
+        if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
+            let _ = mgr.destroy(path);
+        }
+
+        #[cfg(windows)]
+        {
+            for saved in &self.saved_dacls {
+                let _ = crate::platform::windows::restore_dacl(saved);
+            }
+            if let Some(ref name) = self.container_name {
+                let _ = crate::platform::windows::delete_app_container(name);
+            }
+        }
+
+        if self.tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.tmp_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn process_drop_cleans_tmpdir() {
+        let dir = crate::env::make_tmp_dir("drop-test").unwrap();
+        assert!(dir.exists());
+        {
+            let child = std::process::Command::new("true")
+                .spawn()
+                .expect("failed to spawn true");
+            let _process = Process {
+                child: ChildHandle::Managed(child),
+                tmp_dir: dir.clone(),
+                #[cfg(target_os = "linux")]
+                cgroup_path: None,
+                #[cfg(target_os = "linux")]
+                cgroup_mgr: None,
+                #[cfg(all(target_os = "linux", feature = "microvm"))]
+                passt: None,
+                audit_ctx: None,
+                final_stats: None,
+            };
+        }
+        assert!(!dir.exists(), "Drop should have removed the tmpdir");
     }
 }
