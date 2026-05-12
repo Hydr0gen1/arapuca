@@ -691,12 +691,47 @@ pub fn is_safe_resolved_ip(addr: &std::net::IpAddr) -> bool {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_safe_ipv4(&mapped);
             }
+            // Block NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
+            // These embed IPv4 in the low 32 bits — a NAT64 gateway
+            // translates TCP connections to the embedded IPv4 address,
+            // bypassing the IPv4 blocklist. Common on IPv6-only cloud
+            // networks (AWS, GCP, K8s).
+            if let Some(embedded) = nat64_embedded_ipv4(ip) {
+                return is_safe_ipv4(&embedded);
+            }
+            // Block local-use NAT64 prefix 64:ff9b:1::/48 (RFC 8215).
+            // Operator-specific, used in cloud dual-stack VPCs.
+            if is_nat64_local(ip) {
+                return false;
+            }
             !ip.is_loopback()
                 && !ip.is_unspecified()
                 && !is_ipv6_link_local(ip)
                 && !is_ipv6_unique_local(ip)
         }
     }
+}
+
+fn nat64_embedded_ipv4(ip: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = ip.segments();
+    // 64:ff9b::/96 — well-known NAT64 prefix (RFC 6052 §2.1).
+    // IPv4 address is in the last 32 bits (segments 6-7).
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        Some(std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            s[6] as u8,
+            (s[7] >> 8) as u8,
+            s[7] as u8,
+        ))
+    } else {
+        None
+    }
+}
+
+fn is_nat64_local(ip: &std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    // 64:ff9b:1::/48 — local-use NAT64 (RFC 8215).
+    s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001
 }
 
 fn is_safe_ipv4(ip: &std::net::Ipv4Addr) -> bool {
@@ -1404,6 +1439,38 @@ mod tests {
     fn validate_ip_rejects_unique_local() {
         assert!(!is_safe_resolved_ip(&"fc00::1".parse().unwrap()));
         assert!(!is_safe_resolved_ip(&"fd12:3456::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_nat64_loopback() {
+        // 64:ff9b::7f00:1 = NAT64 of 127.0.0.1
+        assert!(!is_safe_resolved_ip(&"64:ff9b::7f00:1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_nat64_rfc1918() {
+        // 64:ff9b::a00:1 = NAT64 of 10.0.0.1
+        assert!(!is_safe_resolved_ip(&"64:ff9b::a00:1".parse().unwrap()));
+        // 64:ff9b::c0a8:101 = NAT64 of 192.168.1.1
+        assert!(!is_safe_resolved_ip(&"64:ff9b::c0a8:101".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_nat64_metadata() {
+        // 64:ff9b::a9fe:a9fe = NAT64 of 169.254.169.254 (cloud metadata)
+        assert!(!is_safe_resolved_ip(&"64:ff9b::a9fe:a9fe".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_rejects_nat64_local_use() {
+        // 64:ff9b:1::1 = local-use NAT64 prefix (RFC 8215)
+        assert!(!is_safe_resolved_ip(&"64:ff9b:1::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_ip_allows_nat64_public() {
+        // 64:ff9b::808:808 = NAT64 of 8.8.8.8 (public DNS — should be allowed)
+        assert!(is_safe_resolved_ip(&"64:ff9b::808:808".parse().unwrap()));
     }
 
     #[test]
