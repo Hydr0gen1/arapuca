@@ -661,3 +661,134 @@ fn seccomp_strict_blocks_proc_read() {
         "strict should block /proc reads: {stdout}"
     );
 }
+
+// ─── PTY mode tests ──────────────────────────────────────────
+
+#[test]
+fn tty_flag_requires_terminal_stdin() {
+    let output = Command::new(arapuca_bin())
+        .args(["run", "-t", "--", "/bin/true"])
+        .stdin(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "-t with piped stdin should exit 125"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("terminal"),
+        "should mention terminal requirement: {stderr}"
+    );
+}
+
+#[test]
+fn tty_long_flag_works() {
+    let output = Command::new(arapuca_bin())
+        .args(["run", "--tty", "--", "/bin/true"])
+        .stdin(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "--tty with piped stdin should exit 125"
+    );
+}
+
+// ─── PTY I/O loop tests ───────────────────────────────────────
+//
+// These require a real PTY via script(1). Skipped if script is
+// not available or cannot allocate a PTY.
+
+fn pty_available() -> bool {
+    script_command("/bin/true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Build a `script(1)` command that works on both GNU (Linux) and
+/// BSD (macOS). GNU: `script -q -c 'cmd' /dev/null`. BSD: `script
+/// -q /dev/null cmd`.
+fn script_command(inner_cmd: &str) -> Command {
+    let mut cmd = Command::new("script");
+    if cfg!(target_os = "linux") {
+        cmd.args(["-q", "-c", inner_cmd, "/dev/null"]);
+    } else {
+        // BSD/macOS: script -q /dev/null <shell> -c <cmd>
+        cmd.args(["-q", "/dev/null", "/bin/sh", "-c", inner_cmd]);
+    }
+    cmd
+}
+
+#[test]
+fn pty_bidirectional_io_no_deadlock() {
+    if !pty_available() {
+        eprintln!("skipping: script(1) not available for PTY allocation");
+        return;
+    }
+
+    let arapuca = arapuca_bin();
+    // Child produces 64KB of output while the PTY I/O loop must
+    // handle it without deadlocking. Heavy unidirectional output
+    // that exceeds the PTY buffer (~4KB). Timeout watchdog detects
+    // the deadlock if the fix regresses.
+    let inner = format!(
+        "{} run --seccomp baseline -t -- /bin/sh -c \
+         'dd if=/dev/zero bs=4096 count=16 2>/dev/null; echo PTY_IO_OK'",
+        arapuca.display()
+    );
+    let mut child = script_command(&inner)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let result = wait_with_timeout(&mut child, std::time::Duration::from_secs(15));
+    match result {
+        Some(status) => {
+            let stdout = {
+                let mut buf = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_string(&mut buf);
+                }
+                buf
+            };
+            let clean = stdout.replace('\r', "");
+            assert!(
+                clean.contains("PTY_IO_OK"),
+                "PTY I/O should complete without deadlock: {clean}"
+            );
+            assert!(status.success(), "should exit 0, got {:?}", status.code());
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("PTY I/O deadlock: timed out after 15 seconds");
+        }
+    }
+}
+
+/// Wait for a child process with a timeout. Returns None on timeout.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+}

@@ -219,3 +219,59 @@ fn stderr_pipe_capture() {
     assert!(status.success());
     assert_eq!(stderr.trim(), "errout");
 }
+
+// ─── PTY validation tests ─────────────────────────────────────
+
+#[test]
+fn tty_rejects_stdin_redirect() {
+    let (r, _w) = pipe_pair();
+    let mut cfg = base_config();
+    cfg.tty = true;
+    cfg.stdin = Some(r.as_raw_fd());
+    let sb = new().unwrap();
+    let msg = sb
+        .launch(&cfg, "/bin/true", &[])
+        .err()
+        .expect("launch should fail with tty + stdio redirect")
+        .to_string();
+    assert!(
+        msg.contains("tty") && msg.contains("incompatible"),
+        "expected tty incompatibility error: {msg}"
+    );
+}
+
+#[test]
+fn tty_rejects_stdout_redirect() {
+    let (_r, w) = pipe_pair();
+    let mut cfg = base_config();
+    cfg.tty = true;
+    cfg.stdout = Some(w.as_raw_fd());
+    let sb = new().unwrap();
+    let msg = sb
+        .launch(&cfg, "/bin/true", &[])
+        .err()
+        .expect("launch should fail with tty + stdio redirect")
+        .to_string();
+    assert!(
+        msg.contains("tty") && msg.contains("incompatible"),
+        "expected tty incompatibility error: {msg}"
+    );
+}
+
+#[test]
+fn tty_rejects_stderr_redirect() {
+    let (_r, w) = pipe_pair();
+    let mut cfg = base_config();
+    cfg.tty = true;
+    cfg.stderr = Some(w.as_raw_fd());
+    let sb = new().unwrap();
+    let msg = sb
+        .launch(&cfg, "/bin/true", &[])
+        .err()
+        .expect("launch should fail with tty + stdio redirect")
+        .to_string();
+    assert!(
+        msg.contains("tty") && msg.contains("incompatible"),
+        "expected tty incompatibility error: {msg}"
+    );
+}
