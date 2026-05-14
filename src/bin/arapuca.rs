@@ -266,6 +266,8 @@ fn run_subcommand(args: &[String]) {
     let mut pids: Option<u32> = None;
     let mut task_id: Option<String> = None;
     let mut seccomp_profile = arapuca::SeccompProfile::Strict;
+    #[cfg(unix)]
+    let mut tty = false;
     #[cfg(target_os = "linux")]
     let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
 
@@ -290,6 +292,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --task-id NAME     identifier for cgroup and audit");
             eprintln!("  --allow-host H:P   allow HTTPS to host:port or *.domain:port");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
+            eprintln!("  -t, --tty          allocate a PTY for interactive programs");
             if sep_pos.is_none() && !args.is_empty() {
                 eprintln!();
                 eprintln!("hint: did you forget '--' before the command?");
@@ -445,6 +448,10 @@ fn run_subcommand(args: &[String]) {
                     std::process::exit(125);
                 }
             }
+            #[cfg(unix)]
+            "-t" | "--tty" => {
+                tty = true;
+            }
             "--seccomp" => {
                 i += 1;
                 let mode = flag_args.get(i).unwrap_or_else(|| {
@@ -530,6 +537,29 @@ fn run_subcommand(args: &[String]) {
         ..Default::default()
     };
 
+    // ── TTY mode validation ────────────────────────────────────
+    #[cfg(unix)]
+    if tty {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!("arapuca run: -t requires stdin and stdout to be a terminal");
+            std::process::exit(125);
+        }
+        // Inject TERM unless the user already specified it.
+        if !user_env.iter().any(|(k, _)| k == "TERM") {
+            if let Ok(term) = std::env::var("TERM") {
+                let sanitized: String = term
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+                    .take(64)
+                    .collect();
+                if !sanitized.is_empty() {
+                    user_env.push(("TERM".into(), sanitized));
+                }
+            }
+        }
+    }
+
     let config = arapuca::Config {
         profile,
         socket_dir: PathBuf::new(),
@@ -545,7 +575,7 @@ fn run_subcommand(args: &[String]) {
         #[cfg(unix)]
         extra_fds: Vec::new(),
         #[cfg(unix)]
-        tty: false,
+        tty,
         network_proxy_socket: connect_proxy_socket.clone(),
         env: user_env,
         audit_sink: None,
@@ -576,6 +606,24 @@ fn run_subcommand(args: &[String]) {
         }
     };
 
+    // ── TTY mode: I/O proxy loop with unified signal handler ───
+    #[cfg(unix)]
+    if tty {
+        let exit_code = run_pty_loop(&mut process, timeout);
+
+        process.cleanup();
+
+        #[cfg(target_os = "linux")]
+        cleanup_connect_proxy(
+            connect_proxy_pid,
+            connect_proxy_pidfd,
+            &connect_proxy_socket,
+        );
+
+        std::process::exit(exit_code);
+    }
+
+    // ── Non-TTY mode: plain wait ─────────────────────────────
     // Forward SIGINT/SIGTERM to the sandboxed child.
     #[cfg(unix)]
     install_signal_forwarder(process.pid() as i32);
@@ -705,6 +753,352 @@ fn cleanup_connect_proxy(pid: Option<i32>, pidfd: Option<i32>, socket: &Option<P
         if let Some(parent) = sock.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+}
+
+// ─── PTY I/O proxy loop ───────────────────────────────────────
+//
+// Handles the entire post-spawn lifecycle in TTY mode: signal
+// handler install, timeout thread, raw mode, poll(2) I/O
+// proxying, SIGWINCH forwarding, child reap, and exit code
+// extraction.
+
+#[cfg(unix)]
+static TTY_SIGNAL_RECEIVED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+static TTY_SIGNAL_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+fn run_pty_loop(process: &mut arapuca::Process, timeout: Option<u64>) -> i32 {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    let master_fd = match process.pty_master() {
+        Some(fd) => fd.as_raw_fd(),
+        None => {
+            eprintln!("arapuca run: -t was set but no PTY master available");
+            return 125;
+        }
+    };
+
+    let stdin_fd: i32 = 0;
+    let stdout_fd: i32 = 1;
+
+    // ── Store child PID for signal forwarding ──────────────────
+    store_child_pid(process.pid() as i32);
+    TTY_SIGNAL_COUNT.store(0, Ordering::Release);
+    TTY_SIGNAL_RECEIVED.store(0, Ordering::Release);
+
+    // ── Set O_NONBLOCK on stdin and PTY master ────────────────
+    // SAFETY: F_GETFL/F_SETFL on valid FDs.
+    let saved_stdin_flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+    unsafe {
+        libc::fcntl(
+            stdin_fd,
+            libc::F_SETFL,
+            saved_stdin_flags | libc::O_NONBLOCK,
+        )
+    };
+    let master_flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(master_fd, libc::F_SETFL, master_flags | libc::O_NONBLOCK) };
+
+    // ── Timeout thread ────────────────────────────────────────
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(secs) = timeout {
+        let done_clone = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            eprintln!("arapuca run: timeout ({secs}s), sending SIGTERM");
+            signal_child(libc::SIGTERM);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            signal_child(libc::SIGKILL);
+        });
+    }
+
+    // ── Install signal handlers + enter raw mode ───────────────
+    // Install handlers BEFORE entering raw mode so that a signal
+    // in the window between tcsetattr(raw) and handler install
+    // doesn't leave the terminal stuck in raw mode. restore_termios()
+    // is a no-op when CLEANUP_FD == -1 (before enter()), so this
+    // is safe.
+    install_tty_signal_handler();
+    arapuca::terminal::install_sigwinch_handler();
+
+    let _raw_guard = arapuca::terminal::RawModeGuard::enter(stdin_fd).unwrap_or_else(|e| {
+        if saved_stdin_flags >= 0 {
+            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, saved_stdin_flags) };
+        }
+        eprintln!("arapuca run: raw mode: {e}");
+        std::process::exit(125);
+    });
+
+    // ── poll(2) I/O loop ──────────────────────────────────────
+    //
+    // Stdin data is buffered in pending_write and drained to the PTY
+    // master via POLLOUT, preventing a deadlock when both directions
+    // are under pressure (child producing output while input buffer
+    // is full). Stdout writes remain synchronous — stdout is always
+    // a terminal (enforced by -t validation) which consumes quickly.
+
+    const PTY_WRITE_BUF_HIGH: usize = 256 * 1024;
+    const PTY_WRITE_BUF_LOW: usize = 128 * 1024;
+
+    let mut pending_write: std::collections::VecDeque<u8> =
+        std::collections::VecDeque::with_capacity(PTY_WRITE_BUF_HIGH);
+
+    let mut fds = [
+        libc::pollfd {
+            fd: master_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stdin_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    let mut buf = [0u8; 65536];
+
+    loop {
+        // Set events dynamically each iteration.
+        // Master: POLLIN always; POLLOUT only when buffer has data.
+        fds[0].events = libc::POLLIN
+            | if pending_write.is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            };
+        // Stdin: POLLIN only when buffer is below low water mark
+        // (hysteresis prevents oscillation). Reserve fd=-1 for
+        // permanent EOF — use events for back-pressure.
+        if fds[1].fd >= 0 {
+            fds[1].events = if pending_write.len() < PTY_WRITE_BUF_LOW {
+                libc::POLLIN
+            } else {
+                0
+            };
+        }
+
+        // SIGWINCH: forward terminal resize to PTY master.
+        if arapuca::terminal::SIGWINCH_RECEIVED.swap(false, Ordering::AcqRel) {
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ on stdin, TIOCSWINSZ on master.
+            if unsafe { libc::ioctl(stdin_fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
+                unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
+            }
+        }
+
+        // SAFETY: poll with valid pollfd array, 100ms timeout.
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        // ── Handler ordering: POLLIN → POLLHUP → POLLOUT → stdin ──
+
+        // 1. PTY master → stdout (drain child output first).
+        if fds[0].revents & libc::POLLIN != 0 {
+            // SAFETY: master_fd is valid, buf is stack-local.
+            let n = unsafe {
+                libc::read(
+                    master_fd,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n > 0 {
+                write_all_fd(stdout_fd, &buf[..n as usize]);
+            }
+        }
+
+        // 2. POLLHUP from master: drain remaining data, discard
+        //    pending writes (slave is closed — writes return EIO),
+        //    then break.
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        master_fd,
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    write_all_fd(stdout_fd, &buf[..n as usize]);
+                } else {
+                    break;
+                }
+            }
+            pending_write.clear();
+            break;
+        }
+
+        // 3. Drain pending_write to PTY master (skip if POLLHUP).
+        if fds[0].revents & libc::POLLOUT != 0 && !pending_write.is_empty() {
+            let contig = pending_write.make_contiguous();
+            // SAFETY: master_fd is valid and O_NONBLOCK; contig is
+            // a valid contiguous buffer from VecDeque.
+            let n = unsafe {
+                libc::write(
+                    master_fd,
+                    contig.as_ptr().cast::<libc::c_void>(),
+                    contig.len(),
+                )
+            };
+            if n > 0 {
+                pending_write.drain(..n as usize);
+            } else if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR)
+                    && err.raw_os_error() != Some(libc::EAGAIN)
+                {
+                    break;
+                }
+            }
+            // n == 0: treat as EAGAIN, retry next iteration.
+        }
+
+        // 4. stdin → pending_write buffer.
+        if fds[1].revents & libc::POLLIN != 0 {
+            // SAFETY: stdin_fd is valid, buf is stack-local.
+            let n =
+                unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n > 0 {
+                pending_write.extend(&buf[..n as usize]);
+            } else if n == 0 {
+                fds[1].fd = -1;
+            }
+        }
+        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            fds[1].fd = -1;
+        }
+    }
+
+    // ── Restore stdin flags ───────────────────────────────────
+    if saved_stdin_flags >= 0 {
+        // SAFETY: restoring saved flags.
+        unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, saved_stdin_flags) };
+    }
+    // RawModeGuard::drop restores terminal state.
+    drop(_raw_guard);
+
+    // ── Reap child and collect exit code ──────────────────────
+    let exit_code = match process.wait() {
+        #[allow(clippy::manual_unwrap_or)]
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                code
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                128 + s.signal().unwrap_or(9)
+            }
+        }
+        Err(e) => {
+            eprintln!("arapuca run: wait: {e}");
+            125
+        }
+    };
+
+    // Disable timeout thread AFTER wait (not before — otherwise a
+    // child that closes its PTY but keeps running hangs forever).
+    done.store(true, Ordering::Release);
+
+    // Clear child PID AFTER setting done (prevents kill(0, sig) race).
+    CHILD_PID.store(0, Ordering::Release);
+    let pidfd = CHILD_PIDFD.swap(-1, Ordering::AcqRel);
+    if pidfd >= 0 {
+        // SAFETY: pidfd is a valid open file descriptor.
+        unsafe { libc::close(pidfd) };
+    }
+
+    // Check if we exited due to a signal (for correct exit code).
+    let sig = TTY_SIGNAL_RECEIVED.load(Ordering::Acquire);
+    if sig > 0 && exit_code == 0 {
+        128 + sig
+    } else {
+        exit_code
+    }
+}
+
+/// Write all bytes to a raw FD, retrying on EINTR and EAGAIN.
+#[cfg(unix)]
+fn write_all_fd(fd: i32, data: &[u8]) {
+    let mut offset = 0;
+    while offset < data.len() {
+        // SAFETY: fd is valid, data[offset..] is a valid buffer.
+        let n = unsafe {
+            libc::write(
+                fd,
+                data[offset..].as_ptr().cast::<libc::c_void>(),
+                data.len() - offset,
+            )
+        };
+        if n > 0 {
+            offset += n as usize;
+        } else if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => {
+                    // SAFETY: poll on a single FD waiting for writability.
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 100) };
+                    continue;
+                }
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// Install the unified TTY signal handler that restores the terminal
+/// and forwards the signal to the child with escalation.
+#[cfg(unix)]
+fn install_tty_signal_handler() {
+    use std::sync::atomic::Ordering;
+
+    extern "C" fn tty_handler(sig: libc::c_int) {
+        // 1. Restore terminal state (async-signal-safe).
+        arapuca::terminal::restore_termios();
+
+        // 2. Forward to child with escalation.
+        let count = TTY_SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
+        let child_sig = if count == 0 { sig } else { libc::SIGKILL };
+        signal_child(child_sig);
+
+        // 3. Record signal for exit code (do NOT raise — parent
+        //    must stay alive for cleanup).
+        TTY_SIGNAL_RECEIVED.store(sig, Ordering::Release);
+    }
+
+    // SAFETY: handler is async-signal-safe (tcsetattr, kill, atomics).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        let handler_ptr: extern "C" fn(libc::c_int) = tty_handler;
+        sa.sa_sigaction = handler_ptr as usize;
+        sa.sa_flags = 0; // No SA_RESTART — poll must return EINTR.
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGQUIT, &sa, std::ptr::null_mut());
     }
 }
 
@@ -2313,9 +2707,27 @@ static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 #[cfg(unix)]
 static CHILD_PIDFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Store the child PID and open a pidfd for race-free signal delivery.
+/// Does NOT install signal handlers — use `install_signal_forwarder`
+/// or `install_tty_signal_handler` after this.
+#[cfg(unix)]
+fn store_child_pid(child_pid: i32) {
+    use std::sync::atomic::Ordering;
+    CHILD_PID.store(child_pid, Ordering::Release);
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: pidfd_open with valid pid.
+        let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+        if ret >= 0 {
+            CHILD_PIDFD.store(ret as i32, Ordering::Release);
+        }
+    }
+}
+
 /// Install signal handlers that forward SIGINT/SIGTERM to a child
 /// process. First signal sends SIGTERM for graceful shutdown; second
-/// signal sends SIGKILL.
+/// signal sends SIGKILL. Also stores child PID/pidfd.
 ///
 /// Linux: uses pidfd for race-free signal delivery with kill() fallback.
 /// Other Unix: uses plain kill() (no pidfd on macOS/BSD).

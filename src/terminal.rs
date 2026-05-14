@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 // uses addr_of_mut! to avoid creating references to static mut
 // (Rust 2024 edition compliance).
 static mut CLEANUP_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
-pub(crate) static CLEANUP_FD: AtomicI32 = AtomicI32::new(-1);
+pub static CLEANUP_FD: AtomicI32 = AtomicI32::new(-1);
 
-pub(crate) struct RawModeGuard {
+pub struct RawModeGuard {
     fd: i32,
     saved: libc::termios,
 }
@@ -28,7 +28,7 @@ impl RawModeGuard {
     /// caller is responsible for installing signal handlers (either
     /// `install_cleanup_signal_handlers` or a custom handler that
     /// calls `restore_termios`).
-    pub(crate) fn enter(fd: i32) -> std::io::Result<Self> {
+    pub fn enter(fd: i32) -> std::io::Result<Self> {
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: tcgetattr on a valid fd.
         if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
@@ -66,7 +66,7 @@ impl Drop for RawModeGuard {
 /// Async-signal-safe. Does nothing if CLEANUP_FD is -1 (raw mode
 /// not active). This is the building block for signal handlers —
 /// it does NOT re-raise or exit.
-pub(crate) fn restore_termios() {
+pub fn restore_termios() {
     let fd = CLEANUP_FD.load(Ordering::Acquire);
     if fd >= 0 {
         // SAFETY: tcsetattr is async-signal-safe per POSIX.
@@ -83,7 +83,7 @@ pub(crate) fn restore_termios() {
 /// Used by `vm exec` which doesn't need child signal forwarding.
 /// For `arapuca run -t`, use `restore_termios()` as a building
 /// block in a custom handler instead.
-pub(crate) fn install_cleanup_signal_handlers() {
+pub fn install_cleanup_signal_handlers() {
     extern "C" fn cleanup_handler(sig: libc::c_int) {
         restore_termios();
         // Re-raise with default disposition for correct exit status.
@@ -107,9 +107,9 @@ pub(crate) fn install_cleanup_signal_handlers() {
 
 // ─── SIGWINCH ─────────────────────────────────────────────────
 
-pub(crate) static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+pub static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn install_sigwinch_handler() {
+pub fn install_sigwinch_handler() {
     extern "C" fn handler(_sig: libc::c_int) {
         SIGWINCH_RECEIVED.store(true, Ordering::Release);
     }
@@ -124,7 +124,7 @@ pub(crate) fn install_sigwinch_handler() {
 
 // ─── Terminal helpers ─────────────────────────────────────────
 
-pub(crate) fn get_terminal_size() -> (u16, u16) {
+pub fn get_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: TIOCGWINSZ on stdin.
     let ret = unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
