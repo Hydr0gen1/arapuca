@@ -39,6 +39,7 @@ fn base_config() -> Config {
         stdout: None,
         stderr: None,
         extra_fds: Vec::new(),
+        tty: false,
         network_proxy_socket: None,
         env: Vec::new(),
         audit_sink: None,

@@ -205,6 +205,7 @@ pub enum SandboxLayer {
     NoNewPrivs,
     EnvFilter,
     FdSanitization,
+    Pty,
     ProxyBridge,
     MicroVm,
     // macOS

@@ -391,6 +391,8 @@ pub extern "C" fn arapuca_config_new() -> *mut ArapucaConfig {
             stderr: None,
             #[cfg(unix)]
             extra_fds: Vec::new(),
+            #[cfg(unix)]
+            tty: false,
             network_proxy_socket: None,
             env: Vec::new(),
             audit_sink: None,

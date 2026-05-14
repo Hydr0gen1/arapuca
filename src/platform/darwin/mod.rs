@@ -553,6 +553,7 @@ mod tests {
             stdout: None,
             stderr: None,
             extra_fds: fds,
+            tty: false,
             network_proxy_socket: None,
             env: vec![],
             audit_sink: None,

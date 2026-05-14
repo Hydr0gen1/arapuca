@@ -146,6 +146,11 @@ pub struct Config {
     /// Additional FDs to inherit to the subprocess.
     #[cfg(unix)]
     pub extra_fds: Vec<RawFd>,
+    /// Allocate a PTY pair and attach the slave as the child's
+    /// controlling terminal. Incompatible with stdin/stdout/stderr
+    /// redirection.
+    #[cfg(unix)]
+    pub tty: bool,
     /// Path to the network proxy Unix socket. When set, the subprocess
     /// receives an env var pointing to this socket. Uses a non-ARAPUCA
     /// prefix so it is not stripped by the binary.
@@ -179,7 +184,8 @@ impl std::fmt::Debug for Config {
             s.field("stdin", &self.stdin)
                 .field("stdout", &self.stdout)
                 .field("stderr", &self.stderr)
-                .field("extra_fds", &self.extra_fds);
+                .field("extra_fds", &self.extra_fds)
+                .field("tty", &self.tty);
         }
         s.field("network_proxy_socket", &self.network_proxy_socket)
             .field("env", &format!("[{} vars]", self.env.len()))

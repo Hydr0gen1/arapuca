@@ -544,6 +544,8 @@ fn run_subcommand(args: &[String]) {
         stderr: None,
         #[cfg(unix)]
         extra_fds: Vec::new(),
+        #[cfg(unix)]
+        tty: false,
         network_proxy_socket: connect_proxy_socket.clone(),
         env: user_env,
         audit_sink: None,
@@ -1264,6 +1266,8 @@ fn image_setup(args: &[String]) {
         stderr: None,
         #[cfg(unix)]
         extra_fds: Vec::new(),
+        #[cfg(unix)]
+        tty: false,
         network_proxy_socket: None,
         env: Vec::new(),
         audit_sink: None,
@@ -2209,6 +2213,8 @@ fn vm_run(args: &[String]) {
         stderr: None,
         #[cfg(unix)]
         extra_fds: Vec::new(),
+        #[cfg(unix)]
+        tty: false,
         network_proxy_socket: None,
         env,
         audit_sink: None,
