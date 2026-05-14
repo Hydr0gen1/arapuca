@@ -151,6 +151,12 @@ impl Darwin {
 
 impl Sandbox for Darwin {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        if cfg.tty {
+            return Err(crate::Error::Validation(
+                "tty mode is not supported on macOS (not yet implemented)".into(),
+            ));
+        }
+
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 

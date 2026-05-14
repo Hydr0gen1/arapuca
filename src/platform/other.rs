@@ -20,6 +20,12 @@ pub struct Other;
 
 impl Sandbox for Other {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        if cfg.tty {
+            return Err(crate::Error::Validation(
+                "tty mode is not supported on this platform".into(),
+            ));
+        }
+
         let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 
         let audit_ctx = cfg

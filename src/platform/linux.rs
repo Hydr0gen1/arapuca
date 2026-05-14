@@ -13,7 +13,7 @@
 //! Landlock, seccomp, and rlimits are applied by the arapuca wrapper
 //! binary at startup (before exec-ing the agent).
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -317,13 +317,75 @@ impl Sandbox for Linux {
             command.env(k, v);
         }
 
-        // Set stdin/stdout/stderr redirection.
-        super::setup_stdio(&mut command, cfg.stdin, "stdin", Command::stdin)?;
-        super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
-        super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
-
+        // Validate extra FDs before PTY allocation so that validation
+        // failures cannot leak openpty FDs.
         super::fd::validate_extra_fds(&cfg.extra_fds, cfg)?;
         let mut fds_to_inherit = std::mem::ManuallyDrop::new(cfg.extra_fds.clone());
+
+        // ── PTY allocation (TTY mode) ─────────────────────────────
+        let (pty_master_fd, pty_slave_fd) = if cfg.tty {
+            if cfg.stdin.is_some() || cfg.stdout.is_some() || cfg.stderr.is_some() {
+                return Err(Error::Validation(
+                    "tty mode is incompatible with stdin/stdout/stderr redirection".into(),
+                ));
+            }
+
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            // SAFETY: openpty with null name/termios/winsize. Parent is
+            // single-threaded at this point (no threads spawned yet), so
+            // the CLOEXEC race window is safe.
+            let ret = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ret != 0 {
+                return Err(Error::Process(format!(
+                    "openpty: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: valid FDs from openpty.
+            unsafe {
+                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+
+            // Copy parent's terminal size (fallback to 24x80).
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ on stdin.
+            if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0
+                && ws.ws_row > 0
+                && ws.ws_col > 0
+            {
+                // SAFETY: TIOCSWINSZ on the PTY master.
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+            } else {
+                ws.ws_row = 24;
+                ws.ws_col = 80;
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+            }
+
+            (Some(master), Some(slave))
+        } else {
+            (None, None)
+        };
+
+        // Set stdin/stdout/stderr redirection.
+        if cfg.tty {
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+        } else {
+            super::setup_stdio(&mut command, cfg.stdin, "stdin", Command::stdin)?;
+            super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
+            super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
+        }
 
         // ── Audit pipe for wrapper binary verification ─────────────
         // When auditing is active and the wrapper binary is used, create
@@ -379,14 +441,26 @@ impl Sandbox for Linux {
             ctx.emit(AuditEvent::FdInheritance {
                 timestamp: ctx.timestamp(),
                 inherited_fds: inherited,
-                stdin_redirected: cfg.stdin.is_some(),
-                stdout_redirected: cfg.stdout.is_some(),
-                stderr_redirected: cfg.stderr.is_some(),
+                stdin_redirected: cfg.stdin.is_some() || cfg.tty,
+                stdout_redirected: cfg.stdout.is_some() || cfg.tty,
+                stderr_redirected: cfg.stderr.is_some() || cfg.tty,
             })?;
         }
         applied_layers.push(SandboxLayer::Setsid);
         applied_layers.push(SandboxLayer::Pdeathsig);
         applied_layers.push(SandboxLayer::FdSanitization);
+
+        #[cfg(unix)]
+        if cfg.tty {
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::Pty,
+                    detail: None,
+                })?;
+            }
+            applied_layers.push(SandboxLayer::Pty);
+        }
 
         // SAFETY: pre_exec runs between fork and exec. Only
         // async-signal-safe functions are permitted. We use raw libc
@@ -404,8 +478,50 @@ impl Sandbox for Linux {
                     return Err(std::io::Error::last_os_error());
                 }
 
+                // Evacuate PTY slave FD above the remap ceiling if it
+                // falls in [3, 3+N) — MUST happen before remap_fds.
+                #[cfg(unix)]
+                let mut slave_fd = pty_slave_fd;
+                #[cfg(unix)]
+                if let Some(ref mut sfd) = slave_fd {
+                    let ceiling = 3 + fds_to_inherit.len() as i32;
+                    if *sfd >= 3 && *sfd < ceiling {
+                        let high = libc::fcntl(*sfd, libc::F_DUPFD_CLOEXEC, ceiling);
+                        if high == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        libc::close(*sfd);
+                        *sfd = high;
+                    }
+                }
+
                 if !fds_to_inherit.is_empty() {
                     super::fd::remap_fds(&mut fds_to_inherit)?;
+                }
+
+                // PTY slave setup: acquire controlling terminal, then
+                // redirect stdio. TIOCSCTTY runs after setsid() which
+                // is the only valid ordering per POSIX.
+                #[cfg(unix)]
+                if let Some(sfd) = slave_fd {
+                    // SAFETY: TIOCSCTTY on the slave PTY. arg=0: do not
+                    // steal from another session (the slave is always
+                    // unowned after openpty + setsid).
+                    if libc::ioctl(sfd, libc::TIOCSCTTY as libc::c_ulong, 0i32) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(sfd, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(sfd, 1) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(sfd, 2) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if sfd > 2 {
+                        libc::close(sfd);
+                    }
                 }
 
                 Ok(())
@@ -552,6 +668,15 @@ impl Sandbox for Linux {
                     libc::close(write_fd);
                 }
             }
+            #[cfg(unix)]
+            {
+                if let Some(m) = pty_master_fd {
+                    unsafe { libc::close(m) };
+                }
+                if let Some(s) = pty_slave_fd {
+                    unsafe { libc::close(s) };
+                }
+            }
             if let Some(ref path) = cgroup_path {
                 if let Some(ref mgr) = self.cgroup_mgr {
                     let _ = mgr.destroy(path);
@@ -559,6 +684,13 @@ impl Sandbox for Linux {
             }
             Error::Process(format!("start sandboxed process: {e}"))
         })?;
+
+        // ── Close PTY slave in parent ──────────────────────────────
+        #[cfg(unix)]
+        if let Some(s) = pty_slave_fd {
+            // SAFETY: valid FD from openpty, no longer needed in parent.
+            unsafe { libc::close(s) };
+        }
 
         // ── Read wrapper audit pipe ────────────────────────────────
         // Close write end in parent (essential — otherwise EOF never
@@ -608,7 +740,10 @@ impl Sandbox for Linux {
             cgroup_mgr: self.cgroup_mgr.clone(),
             #[cfg(feature = "microvm")]
             passt: None,
-            pty_master: None,
+            pty_master: pty_master_fd.map(|fd| {
+                // SAFETY: fd is a valid master FD from openpty with CLOEXEC set.
+                unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) }
+            }),
             audit_ctx,
             final_stats: None,
         })
