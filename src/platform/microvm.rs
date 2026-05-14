@@ -445,6 +445,7 @@ fn launch_vm(
         #[cfg(target_os = "linux")]
         cgroup_mgr: None,
         passt: None,
+        pty_master: None,
         audit_ctx,
         final_stats: None,
     })

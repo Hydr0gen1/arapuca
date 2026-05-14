@@ -5,6 +5,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::io::AsFd;
+
 use crate::ResourceUsage;
 use crate::audit::{AuditContext, AuditEvent};
 
@@ -53,6 +56,11 @@ pub struct Process {
     /// the VM's lifetime; killed on cleanup/drop.
     #[cfg(all(target_os = "linux", feature = "microvm"))]
     pub(crate) passt: Option<crate::platform::microvm_net::PasstHandle>,
+    /// PTY master FD (parent side). Present when `Config::tty` was set.
+    /// The caller should proxy I/O on this FD via `pty_master()`.
+    /// Closed automatically on drop.
+    #[cfg(unix)]
+    pub(crate) pty_master: Option<std::os::unix::io::OwnedFd>,
     /// Audit context for emitting lifecycle events.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) audit_ctx: Option<AuditContext>,
@@ -80,6 +88,15 @@ impl Process {
     /// Path to the process's temporary directory.
     pub fn tmp_dir(&self) -> &std::path::Path {
         &self.tmp_dir
+    }
+
+    /// Returns the PTY master FD, if TTY mode was requested.
+    ///
+    /// The returned `BorrowedFd` is lifetime-bound to this `Process`,
+    /// preventing use-after-close.
+    #[cfg(unix)]
+    pub fn pty_master(&self) -> Option<std::os::unix::io::BorrowedFd<'_>> {
+        self.pty_master.as_ref().map(|fd| fd.as_fd())
     }
 
     /// Wait for the process to exit and return the exit status.
@@ -349,6 +366,7 @@ mod tests {
                 cgroup_mgr: None,
                 #[cfg(all(target_os = "linux", feature = "microvm"))]
                 passt: None,
+                pty_master: None,
                 audit_ctx: None,
                 final_stats: None,
             };

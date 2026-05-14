@@ -154,6 +154,7 @@ impl Sandbox for Other {
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
             tmp_dir: tmp_guard.defuse(),
+            pty_master: None,
             audit_ctx,
             final_stats: None,
         })

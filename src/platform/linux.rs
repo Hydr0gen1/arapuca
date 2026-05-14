@@ -608,6 +608,7 @@ impl Sandbox for Linux {
             cgroup_mgr: self.cgroup_mgr.clone(),
             #[cfg(feature = "microvm")]
             passt: None,
+            pty_master: None,
             audit_ctx,
             final_stats: None,
         })
