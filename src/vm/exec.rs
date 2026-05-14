@@ -8,10 +8,14 @@
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::protocol::{self, ControlMessage, ExecRequest, NONCE_SIZE};
+use crate::terminal::{
+    RawModeGuard, SIGWINCH_RECEIVED, get_terminal_size, install_cleanup_signal_handlers,
+    install_sigwinch_handler,
+};
 
 /// Execute a command in a running VM.
 pub fn exec(
@@ -73,8 +77,12 @@ fn forward_io(stream: &mut UnixStream, tty: bool) -> io::Result<i32> {
     let saved_flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
     unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, saved_flags | libc::O_NONBLOCK) };
 
-    // Enter raw mode for TTY sessions.
+    // Enter raw mode for TTY sessions. Install signal handlers
+    // BEFORE entering raw mode so a signal in the window doesn't
+    // leave the terminal stuck. restore_termios() is a no-op when
+    // CLEANUP_FD == -1 (before enter()), so this is safe.
     let _raw_guard = if tty {
+        install_cleanup_signal_handlers();
         Some(RawModeGuard::enter(stdin_fd)?)
     } else {
         None
@@ -188,116 +196,5 @@ fn forward_io_inner(
             stdin_closed = true;
             fds[1].fd = -1;
         }
-    }
-}
-
-// ─── Terminal helpers ─────────────────────────────────────────
-
-fn get_terminal_size() -> (u16, u16) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: TIOCGWINSZ on stdin.
-    let ret = unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
-    if ret == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
-        (ws.ws_row, ws.ws_col)
-    } else {
-        (24, 80)
-    }
-}
-
-// ─── Raw mode guard ───────────────────────────────────────────
-
-// SAFETY: CLEANUP_TERMIOS is written once (before signal handler
-// install) and read only from the signal handler (after the write).
-// libc::termios is a plain C struct (Copy, no pointers). Access
-// uses addr_of_mut! to avoid creating references to static mut
-// (Rust 2024 edition compliance).
-static mut CLEANUP_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
-static CLEANUP_FD: AtomicI32 = AtomicI32::new(-1);
-
-struct RawModeGuard {
-    fd: i32,
-    saved: libc::termios,
-}
-
-impl RawModeGuard {
-    fn enter(fd: i32) -> io::Result<Self> {
-        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: tcgetattr on a valid fd.
-        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Store for signal handler cleanup (before handler install).
-        // SAFETY: single-threaded at this point, written before
-        // signal handlers are installed.
-        unsafe { std::ptr::addr_of_mut!(CLEANUP_TERMIOS).write(saved) };
-        CLEANUP_FD.store(fd, Ordering::Release);
-
-        install_cleanup_signal_handlers();
-
-        let mut raw = saved;
-        // SAFETY: cfmakeraw modifies the termios struct in place.
-        unsafe { libc::cfmakeraw(&mut raw) };
-        // SAFETY: tcsetattr on a valid fd.
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(Self { fd, saved })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        // SAFETY: restoring saved termios.
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
-        CLEANUP_FD.store(-1, Ordering::Release);
-    }
-}
-
-fn install_cleanup_signal_handlers() {
-    extern "C" fn cleanup_handler(sig: libc::c_int) {
-        let fd = CLEANUP_FD.load(Ordering::Acquire);
-        if fd >= 0 {
-            // SAFETY: tcsetattr is async-signal-safe per POSIX.
-            // CLEANUP_TERMIOS was written before this handler was
-            // installed; the sigaction call provides a memory barrier.
-            unsafe {
-                libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(CLEANUP_TERMIOS));
-            }
-        }
-        // Re-raise with default disposition for correct exit status.
-        // SAFETY: signal + raise are async-signal-safe.
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
-    }
-
-    // SAFETY: handler is async-signal-safe (tcsetattr, signal, raise).
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = cleanup_handler as *const () as usize;
-        sa.sa_flags = 0;
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGQUIT, &sa, std::ptr::null_mut());
-    }
-}
-
-// ─── SIGWINCH ─────────────────────────────────────────────────
-
-static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
-
-fn install_sigwinch_handler() {
-    extern "C" fn handler(_sig: libc::c_int) {
-        SIGWINCH_RECEIVED.store(true, Ordering::Release);
-    }
-    // SAFETY: handler only sets an AtomicBool — async-signal-safe.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as *const () as usize;
-        sa.sa_flags = 0;
-        libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
     }
 }

@@ -31,6 +31,8 @@ mod profile;
 pub mod rlimit;
 #[cfg(seccomp_supported)]
 pub mod seccomp;
+#[cfg(unix)]
+pub(crate) mod terminal;
 mod validate;
 #[cfg(target_os = "linux")]
 pub mod vm;
