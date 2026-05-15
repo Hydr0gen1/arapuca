@@ -13,7 +13,9 @@ arapuca - sandbox a command with kernel-enforced isolation
 
 **arapuca** **run** [*flags*] **-\-** *command* [*args*...]
 
-**arapuca** **-\-** *command* [*args*...]
+**arapuca** **-h** | **-\-help**
+
+**arapuca** **-V** | **-\-version**
 
 # DESCRIPTION
 
@@ -22,10 +24,12 @@ user-friendly CLI flags. Uses the library's platform abstraction for
 cross-platform support (Landlock + seccomp on Linux, Seatbelt on
 macOS, AppContainer on Windows).
 
-**arapuca -\-** *command* (legacy mode) applies sandbox restrictions
-to the current process, then replaces itself with *command* via
-**execve**(2). Configured via environment variables. Used internally
-by the library as a subprocess wrapper.
+The internal wrapper path (**arapuca -\-** *command*) applies sandbox
+restrictions to the current process, then replaces itself with
+*command* via **execve**(2). Configured via environment variables.
+Used internally by the library as a subprocess wrapper — direct CLI
+invocations require **ARAPUCA_WRAPPER=1** to be set by the library.
+Unrecognized subcommands or flags are rejected.
 
 On Linux, **arapuca** enforces Landlock filesystem restrictions,
 seccomp BPF syscall filtering, POSIX resource limits, and sets
@@ -48,9 +52,10 @@ preserved.
 **-v** *path*[**:ro**]
 :   Allow access to *path*. Read-write by default; append **:ro** for
     read-only. Repeatable. Paths must be absolute. Default system paths
-    (*/usr*, */lib*, */bin*, */etc/ssl*, device nodes) are always
-    included. */proc*, */sys*, and blanket */dev* are NOT included by
-    default.
+    (*/usr*, */lib*, */bin*, */etc/ssl*, */tmp*, device nodes) are
+    readable. Only the private per-task temp dir is writable by default.
+    */proc*, */sys*, and blanket */dev* are NOT included by default.
+    Use **-v /tmp** to grant write access to all of */tmp*.
 
 **-\-env** *KEY*=*VALUE*
 :   Pass an environment variable to the sandboxed process. Dangerous
@@ -98,9 +103,21 @@ preserved.
     CGNAT, link-local, and cloud metadata addresses are rejected to
     prevent DNS rebinding SSRF). Linux only.
 
-# ENVIRONMENT (legacy mode)
+**-t**, **-\-tty**
+:   Allocate a pseudo-terminal (PTY) for the sandboxed process. Enables
+    interactive programs (shells, editors, TUI applications) that require
+    a terminal. Requires stdin and stdout to be a terminal. The **TERM**
+    environment variable is forwarded from the host (sanitized).
 
-The following variables configure the legacy **arapuca -\-** mode.
+# ENVIRONMENT (internal wrapper)
+
+**ARAPUCA_WRAPPER**
+
+:   Internal sentinel. Must be set to **1** by the library when invoking
+    the wrapper path. Direct invocations without this variable are
+    rejected. Stripped before exec.
+
+The following variables configure the internal wrapper path.
 They are not used by **arapuca run** (which uses CLI flags instead).
 
 **ARAPUCA_READ_PATHS**
@@ -150,8 +167,9 @@ They are not used by **arapuca run** (which uses CLI flags instead).
 :   The target command exited successfully.
 
 **1**
-:   Usage error in legacy mode (no **-\-** separator, command not found,
-    or sandbox setup failed). A diagnostic is printed to stderr.
+:   Usage error (unrecognized subcommand or flag, missing **ARAPUCA_WRAPPER**
+    sentinel, no **-\-** separator, command not found, or sandbox setup
+    failed). A diagnostic is printed to stderr.
 
 **>1**
 :   The target command exited with a non-zero status. The exit code is
@@ -238,10 +256,17 @@ Sandbox a Claude Code agent with selective HTTPS access:
       --timeout 600 --memory 3072 \
       -- claude --bare -p --model claude-sonnet-4-6
 
-## Legacy mode (arapuca -\-)
+Interactive PTY session inside the sandbox:
+
+    arapuca run -t \
+      -v /home/user/project:ro \
+      --seccomp baseline \
+      -- /bin/bash
+
+## Internal wrapper (arapuca -\-)
 
 Run a Python script with read access to system paths and write access
-to a workspace directory:
+to a workspace directory (requires **ARAPUCA_WRAPPER=1**):
 
     ARAPUCA_READ_PATHS=/usr:/lib:/lib64:/bin:/etc:/dev \
     ARAPUCA_WRITE_PATHS=/tmp/workspace \
@@ -256,10 +281,8 @@ CPU, 1 GB max file size):
     ARAPUCA_RLIMIT_FSIZE=1073741824 \
     arapuca -- ./run-tests.sh
 
-Run with no filesystem restrictions (seccomp + rlimits only on Linux,
-rlimits only on macOS):
-
-    arapuca -- /bin/echo "sandboxed"
+The internal wrapper requires **ARAPUCA_WRAPPER=1** — direct CLI
+invocations are rejected. Use **arapuca run** instead.
 
 # SEE ALSO
 

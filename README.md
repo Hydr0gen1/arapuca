@@ -129,7 +129,8 @@ Works on Linux, macOS, and Windows — the appropriate isolation
 primitives are selected at compile time.
 
 ```bash
-# Run a command with default sandboxing (system paths readable, /tmp writable)
+# Run a command with default sandboxing (system paths readable,
+# private temp dir writable, everything else blocked)
 arapuca run -- /bin/echo hello
 
 # Grant read-only access to a project directory
@@ -158,7 +159,8 @@ arapuca run \
   -- claude --bare -p --model claude-sonnet-4-6
 
 # The sandboxed process:
-# - Can only access default system paths + explicitly granted -v paths
+# - Can only read default system paths + explicitly granted -v paths
+# - Can only write to its private temp dir (use -v /path for more)
 # - Gets a minimal environment (HOME, TMPDIR, PATH, LANG) + --env vars
 # - Is killed after --timeout seconds (SIGTERM, then SIGKILL after 5s)
 # - Cannot override sandbox-managed env vars (HOME, TMPDIR, PATH, LANG)
@@ -178,6 +180,7 @@ arapuca run \
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 | `--seccomp MODE` | Seccomp profile: `strict` (default) or `baseline` |
+| `-t, --tty` | Allocate a PTY for interactive programs |
 
 ### Micro-VM (requires `microvm` feature)
 
@@ -290,6 +293,7 @@ cargo build --features vm-agent --bin arapuca-agent
 | `ARAPUCA_RLIMIT_NPROC` | Max number of processes |
 | `ARAPUCA_RLIMIT_CPU` | Max CPU time in seconds |
 | `ARAPUCA_RLIMIT_FSIZE` | Max file size in bytes |
+| `ARAPUCA_WRAPPER` | Internal sentinel (set by library, required for wrapper path) |
 
 All `ARAPUCA_*` variables are stripped from the environment before
 exec — the sandboxed process cannot inspect its own configuration.
