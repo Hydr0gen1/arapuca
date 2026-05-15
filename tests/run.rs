@@ -732,10 +732,6 @@ fn pty_bidirectional_io_no_deadlock() {
     }
 
     let arapuca = arapuca_bin();
-    // Child produces 64KB of output while the PTY I/O loop must
-    // handle it without deadlocking. Heavy unidirectional output
-    // that exceeds the PTY buffer (~4KB). Timeout watchdog detects
-    // the deadlock if the fix regresses.
     let inner = format!(
         "{} run --seccomp baseline -t -- /bin/sh -c \
          'dd if=/dev/zero bs=4096 count=16 2>/dev/null; echo PTY_IO_OK'",
@@ -791,4 +787,30 @@ fn wait_with_timeout(
             Err(_) => return None,
         }
     }
+}
+
+// ─── /tmp write restriction tests ─────────────────────────────
+
+#[test]
+fn private_tmpdir_writable_but_slash_tmp_blocked() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "touch \"$TMPDIR/ok\" && echo TMPDIR_OK; \
+             touch /tmp/arapuca-tmp-test-fail 2>/dev/null && echo TMP_WRITABLE || echo TMP_BLOCKED",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TMPDIR_OK"),
+        "private temp dir should be writable: {stdout}"
+    );
+    assert!(
+        stdout.contains("TMP_BLOCKED"),
+        "/tmp should be read-only by default: {stdout}"
+    );
 }

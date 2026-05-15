@@ -412,27 +412,30 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         PathBuf::from("/dev/zero"),
         PathBuf::from("/dev/urandom"),
         PathBuf::from("/dev/random"),
+        // Temp directory (read-only — the private per-task temp dir
+        // is added as a write path by the launcher).
+        PathBuf::from("/tmp"),
     ];
-    let write = vec![PathBuf::from("/tmp")];
+    let write = Vec::new();
     (read, write)
 }
 
-/// macOS: Seatbelt profile handles system paths. Only /tmp as writable.
+/// macOS: Seatbelt profile handles system paths.
 #[cfg(target_os = "macos")]
 pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
-    (Vec::new(), vec![PathBuf::from("/tmp")])
+    (Vec::new(), Vec::new())
 }
 
 /// Windows: AppContainer handles system DLL access.
 #[cfg(target_os = "windows")]
 pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
-    (Vec::new(), vec![std::env::temp_dir()])
+    (Vec::new(), Vec::new())
 }
 
 /// Fallback for unsupported platforms.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
-    (Vec::new(), vec![PathBuf::from("/tmp")])
+    (Vec::new(), Vec::new())
 }
 
 /// Create a temporary directory with a random suffix.
@@ -840,9 +843,12 @@ mod tests {
     }
 
     #[test]
-    fn default_sandbox_paths_has_write_paths() {
+    fn default_sandbox_paths_no_default_writes() {
         let (_read, write) = default_sandbox_paths();
-        assert!(!write.is_empty(), "write paths should include temp dir");
+        assert!(
+            write.is_empty(),
+            "default write paths should be empty (private temp dir is added by the launcher)"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -852,7 +858,8 @@ mod tests {
         assert!(read.iter().any(|p| p == Path::new("/usr")));
         assert!(read.iter().any(|p| p == Path::new("/bin")));
         assert!(read.iter().any(|p| p == Path::new("/dev/null")));
-        assert!(write.iter().any(|p| p == Path::new("/tmp")));
+        assert!(read.iter().any(|p| p == Path::new("/tmp")));
+        assert!(write.is_empty());
     }
 
     #[cfg(target_os = "linux")]
