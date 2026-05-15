@@ -102,6 +102,20 @@ fn main() {
     let cmd = &args[cmd_idx];
     let cmd_args = &args[cmd_idx..];
 
+    // Apply sandbox restrictions. Fail-closed: exit non-zero if any
+    // step fails. The subprocess never runs unsandboxed.
+
+    // 0. Sentinel check: the wrapper path must only be invoked by the
+    // library, which sets ARAPUCA_WRAPPER=1. Without it, refuse to
+    // run — prevents direct CLI invocations from bypassing the `run`
+    // subcommand's sandbox configuration. Checked before command
+    // resolution so invalid invocations fail early on all platforms.
+    if std::env::var("ARAPUCA_WRAPPER").as_deref() != Ok("1") {
+        eprintln!("arapuca: wrapper path requires library invocation (ARAPUCA_WRAPPER not set)");
+        eprintln!("hint: use `arapuca run -- command` instead");
+        std::process::exit(1);
+    }
+
     // Resolve the command to an absolute path before applying sandbox
     // restrictions (Landlock would block the stat after apply). This
     // also fixes execve() which, unlike execvp(), does NOT search PATH.
@@ -123,8 +137,38 @@ fn main() {
         }
     };
 
-    // Apply sandbox restrictions. Fail-closed: exit non-zero if any
-    // step fails. The subprocess never runs unsandboxed.
+    // 0b. Unconditional setsid — detach from parent's session.
+    // Called BEFORE pdeathsig since setsid clears it.
+    // Tolerate EPERM (already a session leader from library's pre_exec).
+    #[cfg(unix)]
+    {
+        // SAFETY: setsid is async-signal-safe, no arguments.
+        let ret = unsafe { libc::setsid() };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EPERM) {
+                eprintln!("arapuca: setsid: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 0c. Unconditional PR_SET_NO_NEW_PRIVS — prevent privilege
+    // escalation via setuid binaries. Idempotent (no-op if already set
+    // by landlock::restrict_self). Called unconditionally so this
+    // invariant holds even when Landlock paths are empty.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl with PR_SET_NO_NEW_PRIVS is a simple setter.
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) };
+        if ret != 0 {
+            eprintln!(
+                "arapuca: PR_SET_NO_NEW_PRIVS: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(1);
+        }
+    }
 
     // 1. Landlock filesystem restrictions (Linux only).
     // 2. Seccomp BPF syscall filter (Linux only).

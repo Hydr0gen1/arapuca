@@ -289,6 +289,7 @@ pub fn wrapper_path() -> Option<PathBuf> {
 /// prefix so the wrapper strips them after applying.
 pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
     let mut env = Vec::new();
+    env.push(("ARAPUCA_WRAPPER".into(), "1".into()));
     if !profile.read_paths.is_empty() {
         let paths: Vec<String> = profile
             .read_paths

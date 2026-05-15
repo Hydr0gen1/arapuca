@@ -174,3 +174,58 @@ fn separator_only_no_command() {
         "-- with no command should exit non-zero"
     );
 }
+
+// ─── Wrapper sentinel tests ──────────────────────────────────
+
+#[test]
+fn wrapper_without_sentinel_does_not_execute() {
+    let dir = tempfile::Builder::new()
+        .prefix("arapuca-wrapper-")
+        .tempdir()
+        .unwrap();
+    let marker = dir.path().join("should-not-exist");
+
+    let _status = Command::new(arapuca_bin())
+        .args(["--", "/bin/touch"])
+        .arg(&marker)
+        .output()
+        .unwrap();
+
+    assert!(
+        !marker.exists(),
+        "wrapper path without ARAPUCA_WRAPPER must not execute"
+    );
+}
+
+#[test]
+fn wrapper_without_sentinel_exits_nonzero() {
+    let output = Command::new(arapuca_bin())
+        .args(["--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "wrapper without sentinel should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ARAPUCA_WRAPPER"),
+        "should mention ARAPUCA_WRAPPER: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wrapper_with_sentinel_and_paths_succeeds() {
+    let output = Command::new(arapuca_bin())
+        .args(["--", "/bin/true"])
+        .env("ARAPUCA_WRAPPER", "1")
+        .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin")
+        .env("ARAPUCA_WRITE_PATHS", "/tmp")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wrapper with sentinel + paths should succeed"
+    );
+}

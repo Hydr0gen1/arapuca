@@ -29,6 +29,7 @@ fn sandboxed_command(
     Command::new(arapuca_bin())
         .args(["--", cmd])
         .args(args)
+        .env("ARAPUCA_WRAPPER", "1")
         .env("ARAPUCA_READ_PATHS", read_paths)
         .env("ARAPUCA_WRITE_PATHS", write_paths)
         .output()
@@ -40,6 +41,7 @@ fn seccomp_only_command(cmd: &str, args: &[&str]) -> std::process::Output {
     Command::new(arapuca_bin())
         .args(["--", cmd])
         .args(args)
+        .env("ARAPUCA_WRAPPER", "1")
         .output()
         .expect("failed to run arapuca")
 }
@@ -177,6 +179,7 @@ fn env_stripping() {
     // ARAPUCA_* env vars should be stripped before exec.
     let output = Command::new(arapuca_bin())
         .args(["--", "/bin/sh", "-c", "env | grep ARAPUCA_ || echo CLEAN"])
+        .env("ARAPUCA_WRAPPER", "1")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc:/dev")
         .env("ARAPUCA_WRITE_PATHS", "/tmp")
         .env("ARAPUCA_SECRET", "should-not-leak")
@@ -194,6 +197,9 @@ fn non_arapuca_env_preserved() {
     // Non-ARAPUCA env vars should be preserved.
     let output = Command::new(arapuca_bin())
         .args(["--", "/bin/sh", "-c", "echo $AGENT_TEST_VAR"])
+        .env("ARAPUCA_WRAPPER", "1")
+        .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc:/dev")
+        .env("ARAPUCA_WRITE_PATHS", "/tmp")
         .env("AGENT_TEST_VAR", "preserved")
         .output()
         .expect("failed to run arapuca");
