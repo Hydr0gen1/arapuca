@@ -42,6 +42,41 @@ fn main() {
         return;
     }
 
+    // ── Dispatch guard ────────────────────────────────────────
+    // Reject anything that is not a recognized subcommand or the
+    // internal wrapper separator "--". Without this, unrecognized
+    // args (flags, typos) fall through to the wrapper path which
+    // runs with reduced sandbox enforcement.
+    match args.get(1).map(|s| s.as_str()) {
+        None => {
+            print_usage();
+            std::process::exit(1);
+        }
+        Some("-h" | "--help") => {
+            print_usage();
+            std::process::exit(0);
+        }
+        Some("-V" | "--version") => {
+            eprintln!("arapuca {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some("--") => {} // wrapper path — fall through
+        Some(arg) => {
+            if arg.starts_with('-') {
+                eprintln!("arapuca: unknown flag: {arg}");
+            } else {
+                eprintln!("arapuca: unknown subcommand: {arg}");
+            }
+            print_usage();
+            std::process::exit(1);
+        }
+    }
+
+    // ── Internal wrapper path ─────────────────────────────────
+    // Only reachable when args[1] == "--". Used by the library
+    // (Linux::launch, Darwin::launch) to apply Landlock, seccomp,
+    // and rlimits to the target command via execve.
+
     // Audit FD: if set, write JSON status lines as each layer is applied.
     // The library creates a pipe and passes the write end via this env var.
     // Closed before execve so the target command cannot write to it.
@@ -50,12 +85,16 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok());
 
-    // Find -- separator.
-    let sep_idx = args.iter().position(|a| a == "--");
+    // Find -- separator (scan from index 1 to prevent argv[0] manipulation).
+    let sep_idx = args[1..].iter().position(|a| a == "--").map(|i| i + 1);
+    debug_assert!(
+        sep_idx == Some(1),
+        "dispatch guard ensures args[1] == \"--\""
+    );
     let cmd_idx = match sep_idx {
         Some(i) if i + 1 < args.len() => i + 1,
         _ => {
-            eprintln!("arapuca: usage: arapuca <run|image|vm> | [-- command ...]");
+            print_usage();
             std::process::exit(1);
         }
     };
@@ -1100,6 +1139,22 @@ fn install_tty_signal_handler() {
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGQUIT, &sa, std::ptr::null_mut());
     }
+}
+
+fn print_usage() {
+    eprintln!("usage: arapuca <subcommand> [flags] -- command [args...]");
+    eprintln!();
+    eprintln!("subcommands:");
+    eprintln!("  run        run a command in a process sandbox");
+    eprintln!("  image      manage VM images");
+    #[cfg(feature = "microvm")]
+    eprintln!("  vm         manage micro-VMs");
+    eprintln!();
+    eprintln!("flags:");
+    eprintln!("  -h, --help       show this help");
+    eprintln!("  -V, --version    show version");
+    eprintln!();
+    eprintln!("run `arapuca run --help` for run subcommand flags");
 }
 
 fn parse_volume_spec(spec: &str) -> (PathBuf, bool) {
