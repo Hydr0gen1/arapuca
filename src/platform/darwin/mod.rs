@@ -13,6 +13,7 @@
 
 mod darwin_profile;
 
+use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -151,12 +152,6 @@ impl Darwin {
 
 impl Sandbox for Darwin {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
-        if cfg.tty {
-            return Err(crate::Error::Validation(
-                "tty mode is not supported on macOS (not yet implemented)".into(),
-            ));
-        }
-
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
@@ -393,13 +388,77 @@ impl Sandbox for Darwin {
             command.env(k, v);
         }
 
-        // stdin/stdout/stderr redirection.
-        crate::platform::setup_stdio(&mut command, cfg.stdin, "stdin", Command::stdin)?;
-        crate::platform::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
-        crate::platform::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
-
+        // Validate extra FDs before PTY allocation so that validation
+        // failures cannot leak openpty FDs.
         super::fd::validate_extra_fds(&cfg.extra_fds, cfg)?;
         let mut fds_to_inherit = std::mem::ManuallyDrop::new(cfg.extra_fds.clone());
+
+        // ── PTY allocation (TTY mode) ─────────────────────────────
+        let (pty_master_fd, pty_slave_fd) = if cfg.tty {
+            if cfg.stdin.is_some() || cfg.stdout.is_some() || cfg.stderr.is_some() {
+                return Err(Error::Validation(
+                    "tty mode is incompatible with stdin/stdout/stderr redirection".into(),
+                ));
+            }
+
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            // SAFETY: openpty with null name/termios/winsize. No threads
+            // are spawned yet (memory monitor and parent watchdog start
+            // after spawn), so the CLOEXEC race window is safe.
+            let ret = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ret != 0 {
+                return Err(Error::Process(format!(
+                    "openpty: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: valid FDs from openpty.
+            unsafe {
+                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+
+            // Copy parent's terminal size (fallback to 24x80).
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ on stdin.
+            if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0
+                && ws.ws_row > 0
+                && ws.ws_col > 0
+            {
+                // SAFETY: TIOCSWINSZ on the PTY master.
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+            } else {
+                ws.ws_row = 24;
+                ws.ws_col = 80;
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+            }
+
+            (Some(master), Some(slave))
+        } else {
+            (None, None)
+        };
+
+        // stdin/stdout/stderr redirection. In TTY mode, use Stdio::null()
+        // to prevent the parent's real stdio from being inherited between
+        // fork and pre_exec (where dup2 overwrites them with the PTY slave).
+        if cfg.tty {
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+        } else {
+            crate::platform::setup_stdio(&mut command, cfg.stdin, "stdin", Command::stdin)?;
+            crate::platform::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
+            crate::platform::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
+        }
 
         // Emit SandboxReady before spawn.
         if let Some(ref ctx) = audit_ctx {
@@ -411,6 +470,14 @@ impl Sandbox for Darwin {
             ];
             if use_wrapper {
                 applied.push(SandboxLayer::Rlimit);
+            }
+            if cfg.tty {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::Pty,
+                    detail: None,
+                })?;
+                applied.push(SandboxLayer::Pty);
             }
             ctx.emit(AuditEvent::SandboxReady {
                 timestamp: ctx.timestamp(),
@@ -428,23 +495,78 @@ impl Sandbox for Darwin {
         }
 
         // SAFETY: pre_exec runs between fork and exec. Only async-signal-safe
-        // functions are used (setsid, fcntl, dup2, close). ManuallyDrop
-        // prevents free() on the Vec in the child process.
+        // functions are used (setsid, fcntl, dup2, close, ioctl).
+        // ManuallyDrop prevents free() on the Vec in the child process.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+
+                // Evacuate PTY slave FD above the remap ceiling if it
+                // falls in [3, 3+N) — MUST happen before remap_fds.
+                let mut slave_fd = pty_slave_fd;
+                if let Some(ref mut sfd) = slave_fd {
+                    let ceiling = 3 + fds_to_inherit.len() as i32;
+                    if *sfd >= 3 && *sfd < ceiling {
+                        let high = libc::fcntl(*sfd, libc::F_DUPFD_CLOEXEC, ceiling);
+                        if high == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        libc::close(*sfd);
+                        *sfd = high;
+                    }
+                }
+
                 if !fds_to_inherit.is_empty() {
                     super::fd::remap_fds(&mut fds_to_inherit)?;
                 }
+
+                // PTY slave setup: acquire controlling terminal, then
+                // redirect stdio. TIOCSCTTY runs after setsid() which
+                // is the only valid ordering per POSIX.
+                if let Some(sfd) = slave_fd {
+                    // SAFETY: TIOCSCTTY on the slave PTY. arg=0: do not
+                    // steal from another session. On macOS TIOCSCTTY is
+                    // c_uint; the cast to c_ulong is a safe widening.
+                    if libc::ioctl(sfd, libc::TIOCSCTTY as libc::c_ulong, 0i32) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(sfd, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(sfd, 1) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(sfd, 2) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if sfd > 2 {
+                        libc::close(sfd);
+                    }
+                }
+
                 Ok(())
             });
         }
 
-        let child = command
-            .spawn()
-            .map_err(|e| Error::Process(format!("start sandboxed process: {e}")))?;
+        let child = command.spawn().map_err(|e| {
+            if let Some(m) = pty_master_fd {
+                // SAFETY: valid FD from openpty, cleanup on spawn failure.
+                unsafe { libc::close(m) };
+            }
+            if let Some(s) = pty_slave_fd {
+                // SAFETY: valid FD from openpty, cleanup on spawn failure.
+                unsafe { libc::close(s) };
+            }
+            Error::Process(format!("start sandboxed process: {e}"))
+        })?;
+
+        // Close PTY slave in parent — only needed in the child.
+        if let Some(s) = pty_slave_fd {
+            // SAFETY: valid FD from openpty, no longer needed in parent.
+            unsafe { libc::close(s) };
+        }
 
         let pid = child.id();
 
@@ -482,7 +604,8 @@ impl Sandbox for Darwin {
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
             tmp_dir: tmp_guard.defuse(),
-            pty_master: None,
+            // SAFETY: fd is a valid master FD from openpty with CLOEXEC set.
+            pty_master: pty_master_fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
             audit_ctx,
             final_stats: None,
         })
@@ -599,5 +722,41 @@ mod tests {
             Ok(_) => panic!("expected error for too many FDs"),
         };
         assert!(err.contains("too many FDs"), "got: {err}");
+    }
+
+    #[test]
+    fn darwin_tty_rejects_stdin_redirect() {
+        let mut cfg = test_config_with_extra_fds(vec![]);
+        cfg.tty = true;
+        cfg.stdin = Some(5);
+        let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for tty + stdin"),
+        };
+        assert!(err.contains("incompatible"), "got: {err}");
+    }
+
+    #[test]
+    fn darwin_tty_rejects_stdout_redirect() {
+        let mut cfg = test_config_with_extra_fds(vec![]);
+        cfg.tty = true;
+        cfg.stdout = Some(5);
+        let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for tty + stdout"),
+        };
+        assert!(err.contains("incompatible"), "got: {err}");
+    }
+
+    #[test]
+    fn darwin_tty_rejects_stderr_redirect() {
+        let mut cfg = test_config_with_extra_fds(vec![]);
+        cfg.tty = true;
+        cfg.stderr = Some(5);
+        let err = match Darwin.launch(&cfg, "/bin/true", &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for tty + stderr"),
+        };
+        assert!(err.contains("incompatible"), "got: {err}");
     }
 }
