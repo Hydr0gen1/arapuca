@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "Version validated: $CARGO_VERSION"
+
+      - name: Verify tag is on default branch
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME does not point to a commit on main"
+            exit 1
+          fi
+          echo "Tag is on main"
+
+  build:
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: arapuca-linux-x86_64
+            sdk: true
+            native: true
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: arapuca-linux-x86_64-static
+            sdk: false
+            native: true
+
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: arapuca-linux-aarch64
+            sdk: true
+            native: true
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: arapuca-darwin-arm64
+            sdk: false
+            native: true
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: arapuca-darwin-x86_64
+            sdk: false
+            native: false
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: arapuca-windows-x86_64
+            sdk: false
+            native: true
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cbindgen
+        if: matrix.sdk
+        run: cargo install cbindgen --locked
+
+      - name: Run tests
+        if: matrix.native
+        run: cargo test --locked --release --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package binary (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          STAGING="arapuca-${VERSION}"
+          mkdir -p "$STAGING"
+          cp "target/${TARGET}/release/arapuca" "$STAGING/"
+          tar czf "${ARTIFACT}.tar.gz" "$STAGING"
+
+      - name: Package binary (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          STAGING="arapuca-${VERSION}"
+          mkdir -p "$STAGING"
+          cp "target/${TARGET}/release/arapuca.exe" "$STAGING/"
+          7z a "${ARTIFACT}.zip" "$STAGING"
+
+      - name: Build and package SDK
+        if: matrix.sdk
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          make package
+          make install DESTDIR="$PWD/dist/staging" PREFIX=/usr/local
+          tar czf "arapuca-sdk-${ARTIFACT}.tar.gz" \
+              -C dist/staging/usr/local .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+          if-no-files-found: error
+
+      - name: Upload SDK artifact
+        if: matrix.sdk
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: arapuca-sdk-${{ matrix.artifact }}
+          path: arapuca-sdk-${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          sha256sum *.tar.gz *.zip | tee sha256sums.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9  # v3
+
+      - name: Sign artifacts
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          for f in *.tar.gz *.zip sha256sums.txt; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes "$f" --bundle "${f}.cosign.bundle"
+          done
+
+      - name: Verify all artifacts are signed
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          for f in *.tar.gz *.zip sha256sums.txt; do
+            [ -f "$f" ] || continue
+            [ -f "${f}.cosign.bundle" ] || { echo "::error::Missing signature for $f"; exit 1; }
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
+          fail_on_unmatched_files: true
