@@ -71,7 +71,6 @@ const MITIGATION_POLICY: u64 = 0x01           // DEP enable
     | (1 << 16)                                // bottom-up ASLR
     | (1 << 20)                                // high-entropy ASLR (x64)
     | (1 << 24)                                // strict handle checks
-    | (1 << 28)                                // Win32k syscall disable
     | (1 << 32)                                // extension point disable
     | (1 << 52)                                // image load no remote
     | (1 << 56); // image load no low label
@@ -109,8 +108,13 @@ impl Sandbox for Windows {
             .collect();
         let inherit_handles = if handle_list.is_empty() { 0 } else { TRUE };
 
-        let use_appcontainer =
-            !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
+        let disable_appcontainer = cfg
+            .env
+            .iter()
+            .any(|(key, value)| key == "DIVE_DISABLE_APPCONTAINER" && value == "1");
+        let use_appcontainer = (!cfg.profile.read_paths.is_empty()
+            || !cfg.profile.write_paths.is_empty())
+            && !disable_appcontainer;
 
         // ── AppContainer path: filesystem + network isolation ──
         let mut container_name_owned: Option<String> = None;
@@ -145,12 +149,20 @@ impl Sandbox for Windows {
                 match save_dacl(path) {
                     Ok(sd) => {
                         if let Err(e) = grant_path_access(path, ac_sid.sid, READ_EXEC, true) {
+                            if grant_failure_is_nonfatal(&e) {
+                                log::warn!("skipping read mount for {}: {e}", path.display());
+                                continue;
+                            }
                             rollback(&saved_dacls, &name);
                             return Err(e);
                         }
                         saved_dacls.push(sd);
                     }
                     Err(e) => {
+                        if grant_failure_is_nonfatal(&e) {
+                            log::warn!("skipping read mount for {}: {e}", path.display());
+                            continue;
+                        }
                         rollback(&saved_dacls, &name);
                         return Err(e);
                     }
@@ -887,10 +899,37 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     ));
     env.push(("TEMP".into(), tmp_dir.to_string_lossy().into_owned()));
     env.push(("TMP".into(), tmp_dir.to_string_lossy().into_owned()));
-    env.push((
-        "PATH".into(),
-        format!(r"{system_root}\system32;{system_root}"),
-    ));
+    if let Some((_, python_home)) = env
+        .iter()
+        .find(|(key, _)| key == "DIVE_TOOL_PYTHONHOME")
+        .cloned()
+    {
+        env.retain(|(key, _)| key != "PYTHONHOME" && key != "DIVE_TOOL_PYTHONHOME");
+        env.push(("PYTHONHOME".into(), python_home));
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let home = PathBuf::from(home);
+        env.push((
+            "RUSTUP_HOME".into(),
+            home.join(".rustup").to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "CARGO_HOME".into(),
+            home.join(".cargo").to_string_lossy().into_owned(),
+        ));
+    }
+    let system_path = format!(r"{system_root}\system32;{system_root}");
+    let tool_path = env
+        .iter()
+        .find(|(key, _)| key == "DIVE_NATIVE_TOOL_PATH")
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty());
+    let path = match tool_path {
+        Some(value) => format!("{system_path};{value}"),
+        None => system_path,
+    };
+    env.retain(|(key, _)| key != "PATH");
+    env.push(("PATH".into(), path));
     env.push(("SystemRoot".into(), system_root));
     env.push(("LANG".into(), "C.UTF-8".into()));
 
@@ -1235,6 +1274,11 @@ pub fn grant_path_access(
     }
 
     Ok(())
+}
+
+fn grant_failure_is_nonfatal(error: &Error) -> bool {
+    const ERROR_ACCESS_DENIED: &str = "error 5";
+    matches!(error, Error::Process(message) if message.contains(ERROR_ACCESS_DENIED))
 }
 
 /// Delete an AppContainer profile by name.
